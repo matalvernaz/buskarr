@@ -1,11 +1,14 @@
 # buskarr
 
+![tests](https://github.com/matalvernaz/buskarr/actions/workflows/tests.yml/badge.svg)
+
 A track-first music acquisition manager. Built because Lidarr's atomic unit is the *release*, which
 makes it structurally unable to handle a singles-heavy library: one artist here has 54 releases on
 Deezer, 24 in MusicBrainz, and 22 that Lidarr could see.
 
-It has no authentication of its own: it trusts oauth2-proxy-style forwarded-identity headers, so
-it belongs on localhost or behind a reverse proxy that handles login.
+Self-hosted, one Docker container, SQLite, no external database. It has no authentication of its
+own: it trusts oauth2-proxy-style forwarded-identity headers, so it belongs on localhost or behind
+a reverse proxy that handles login.
 
 ## What it does differently
 
@@ -41,11 +44,55 @@ providers and recovers material already downloaded but never imported — there 
 directories holding ~106GB, rejected by Lidarr because it refuses a release unless 80% of an album
 matches, discarding an 11-of-16-track download whole.
 
+## Installing
+
+    git clone https://github.com/matalvernaz/buskarr
+    cd buskarr
+    cp compose.example.yaml compose.yaml
+    # edit compose.yaml: your music path, your downloads path, which providers you use
+    docker compose up -d --build
+
+Then open `http://localhost:8000`, hit "Rescan library from disk" on the Overview page, and add
+music from the Add music page. `state/` holds the database, staging, cookies and Tidal auth, and
+must persist. The worker and the web UI share one container because they share the SQLite file.
+
+Provider setup, all optional — with none configured you can still scan, browse and manage the
+library:
+
+* **Tidal** — set `TIDDL_AUTH` in `.env` (a client credential pair for
+  [tiddl](https://github.com/oskvr37/tiddl); see its documentation), then authenticate once:
+  `docker exec -it buskarr /opt/tiddl-venv/bin/tiddl auth login`. The session refreshes itself
+  under `state/home`.
+* **YouTube** — export logged-in cookies (Netscape format) to `state/cookies.txt` for 256k AAC;
+  without them fetches still work at ~130k.
+* **Soulseek** — point `SLSKD_URL`/`SLSKD_API_KEY` at a running [slskd](https://github.com/slskd/slskd),
+  and put its completed-downloads directory in `DOWNLOAD_DIRS`.
+* **Prowlarr/qBittorrent** — for `buskarr.grab`. Give Prowlarr a qBittorrent download client
+  with a dedicated category whose save path is inside `DOWNLOAD_DIRS`. Note qBittorrent applies a
+  category's save path only under automatic torrent management; `grab` switches its torrents to
+  AutoTMM itself.
+
+Tests need only `mutagen` from pip: `for t in tests/test_*.py; do python3 "$t"; done`.
+
+## Day to day
+
+Adding and monitoring happen in the web UI. The maintenance modules run by hand, print what they
+would do by default, and only act with `--apply`:
+
+    docker exec buskarr python3 -m buskarr.harvest          # match completed downloads (dry-run)
+    docker exec buskarr python3 -m buskarr.harvest --apply
+    docker exec buskarr python3 -m buskarr.upgrade --apply  # replace lossy files, worst first
+    docker exec buskarr python3 -m buskarr.grab --apply     # torrent grabs for unavailable albums
+    docker exec buskarr python3 -m buskarr.dedupe           # what duplicates would be quarantined
+
+After anything that moves files, rescan (the Overview button, or the same module pattern) so the
+database matches the disk.
+
 ## Vetting
 
-Three gates, all must pass. Ported from soultube where they have a track record: they rejected a
-kids' choir singing "Jellyfish" as an Arrogant Worms track, and refused a 206-second Tidal edit of
-a song whose local copy runs 255 seconds.
+Three gates, all must pass. Ported from a predecessor script where they built a track record:
+they rejected a kids' choir singing "Jellyfish" as an Arrogant Worms track, and refused a
+206-second Tidal edit of a song whose local copy runs 255 seconds.
 
 * **Duration** — ±15% normally, ±4% when replacing a file whose exact length is known.
 * **Title** — token overlap ≥0.7, or difflib ratio ≥0.72 for word-order differences.
@@ -76,7 +123,7 @@ Files are placed as `<Artist>/<Album> (<Year>)/NN - Title.ext`, matching the exi
 * **`tiddl` is pinned to 3.4.4**, which requires Python ≥3.13. Unpinned installs on 3.12 silently
   resolve down to 2.8.0, which has an incompatible CLI and fails at fetch time rather than install
   time. The pin makes that loud.
-* **`/opt/downloads` is mounted read-only** so the harvester cannot disturb what qBittorrent and
+* **The downloads mount is read-only** so the harvester cannot disturb what qBittorrent and
   slskd are still seeding.
 * Escalating backoff on failures: 24h doubling to a 30-day cap. An *empty* search result gets only
   1h, because a throttled session is indistinguishable from a song nobody has, and treating one as
@@ -100,35 +147,6 @@ Maintenance modules, all dry-run by default (`--apply` to act):
     buskarr/dedupe.py     quarantine duplicate recordings, best copy kept
     buskarr/upgrade.py    replace held lossy files with better copies (originals quarantined)
     buskarr/grab.py       album-level torrent grabs via Prowlarr for unavailable tracks
-
-## Installing
-
-    git clone https://github.com/matalvernaz/buskarr
-    cd buskarr
-    cp compose.example.yaml compose.yaml
-    # edit compose.yaml: your music path, your downloads path, which providers you use
-    docker compose up -d --build
-
-Then open `http://localhost:8000`. `state/` holds the database, staging, cookies and Tidal auth,
-and must persist. The worker and the web UI share one container because they share the SQLite
-file.
-
-Provider setup, all optional — with none configured you can still scan, browse and manage the
-library:
-
-* **Tidal** — set `TIDDL_AUTH` (a `client_id;client_secret` pair for tiddl) in `.env`, then
-  authenticate once: `docker exec -it buskarr /opt/tiddl-venv/bin/tiddl auth login`. The session
-  refreshes itself under `state/home`.
-* **YouTube** — export logged-in cookies (Netscape format) to `state/cookies.txt` for 256k AAC;
-  without them fetches still work at ~130k.
-* **Soulseek** — point `SLSKD_URL`/`SLSKD_API_KEY` at a running [slskd](https://github.com/slskd/slskd),
-  and put its completed-downloads directory in `DOWNLOAD_DIRS`.
-* **Prowlarr/qBittorrent** — for `buskarr.grab`. Give Prowlarr a qBittorrent download client
-  with a dedicated category whose save path is inside `DOWNLOAD_DIRS`. Note qBittorrent applies a
-  category's save path only under automatic torrent management; `grab` switches its torrents to
-  AutoTMM itself.
-
-Tests run without any of that: `for t in tests/test_*.py; do python3 "$t"; done`.
 
 ## Not done yet
 
