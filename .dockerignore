@@ -1,0 +1,7 @@
+# Runtime state holds live Tidal tokens and YouTube session cookies. It is bind-mounted at run
+# time and must never enter a build context.
+state/
+tests/
+__pycache__/
+*.pyc
+.git/

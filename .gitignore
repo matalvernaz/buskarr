@@ -1,0 +1,8 @@
+# Live secrets (Tidal session, YouTube cookies, API keys) and this deployment's compose file,
+# which carries site-specific domains and reverse-proxy labels. The repo ships
+# compose.example.yaml instead.
+state/
+.env
+compose.yaml
+__pycache__/
+*.pyc

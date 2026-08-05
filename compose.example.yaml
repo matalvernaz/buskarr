@@ -1,0 +1,59 @@
+# Example deployment. Copy to compose.yaml, adjust the paths and the .env secrets, then:
+#     docker compose up -d --build
+#
+# buskarr has NO authentication of its own: it trusts oauth2-proxy-style forwarded-identity
+# headers. Keep it on localhost, or put it behind a reverse proxy that handles auth, before
+# exposing it anywhere.
+services:
+  buskarr:
+    build: .
+    image: buskarr:latest
+    container_name: buskarr
+    # Should own the music library files.
+    user: "1000:1000"
+    environment:
+      LIBRARY_DIR: "/music"
+      BUSKARR_DB: "/state/buskarr.db"
+      STAGING_DIR: "/state/staging"
+      # ---- providers; leave any you don't use unset and buskarr skips them ----
+      # Tidal (FLAC): authenticate tiddl once with `docker exec -it buskarr
+      # /opt/tiddl-venv/bin/tiddl auth login`; the session persists under /state/home.
+      TIDDL_AUTH: "${TIDDL_AUTH:-}"
+      TIDAL_AUTH_JSON: "/state/tidal_auth.json"
+      # YouTube: 256k AAC needs logged-in cookies (Netscape format) at this path, else ~130k.
+      YT_COOKIES: "/state/cookies.txt"
+      # Soulseek via slskd.
+      SLSKD_URL: ""
+      SLSKD_API_KEY: "${SLSKD_API_KEY:-}"
+      # Album-level torrent grabs for unavailable tracks (python3 -m buskarr.grab).
+      PROWLARR_URL: ""
+      PROWLARR_API_KEY: "${PROWLARR_API_KEY:-}"
+      QBIT_URL: ""
+      # ---- behaviour ----
+      INTERVAL: "1800"
+      PER_CYCLE: "25"
+      # Where completed downloads land (slskd, torrent client) for harvesting.
+      DOWNLOAD_DIRS: "/downloads/complete"
+      # tiddl rewrites its token under $HOME, so HOME must persist across restarts.
+      HOME: "/state/home"
+      DENO_DIR: "/tmp/deno"
+      # Hosts allowed to submit forms (cross-origin write protection). Add your public
+      # hostname when serving through a reverse proxy.
+      ALLOWED_ORIGIN_HOSTS: "127.0.0.1,localhost"
+    ports:
+      - "8000:8000"
+    volumes:
+      # The music library, read-write: acquired files are placed here.
+      - /path/to/music:/music
+      # Database, staging, and credentials that must survive a rebuild.
+      - ./state:/state
+      # Completed downloads, READ-ONLY: harvesting copies out of here and must never be
+      # able to disturb what your download clients are still seeding.
+      - /path/to/downloads:/downloads:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8000/healthz"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
