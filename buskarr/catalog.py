@@ -183,8 +183,18 @@ class Deezer:
             out.append({"source": self.name, "artist": (t.get("artist") or {}).get("name", ""),
                         "title": t.get("title") or "",
                         "album": (t.get("album") or {}).get("title") or "",
+                        # The release this track belongs to, usable with bulk.album_detail. The
+                        # title alone cannot get back to the release — same-titled editions abound.
+                        "album_ref": str((t.get("album") or {}).get("id") or "") or None,
                         "year": None, "duration": float(t.get("duration") or 0) or None})
         return out
+
+    def search_albums(self, q, limit=10):
+        d = _get(f"{self.api}/search/album?q={urllib.parse.quote(q)}&limit={limit}")
+        return [{"source": self.name, "ref": str(a["id"]), "title": a.get("title") or "",
+                 "artist": (a.get("artist") or {}).get("name") or "",
+                 "kind": a.get("record_type"), "tracks": a.get("nb_tracks")}
+                for a in d.get("data", []) if a.get("id")]
 
     def search_artists(self, q, limit=8):
         d = _get(f"{self.api}/search/artist?q={urllib.parse.quote(q)}&limit={limit}")
@@ -407,9 +417,21 @@ class ITunes:
             out.append({"source": self.name, "artist": t.get("artistName") or "",
                         "title": t.get("trackName") or "",
                         "album": t.get("collectionName") or "",
+                        "album_ref": str(t.get("collectionId") or "") or None,
                         "year": (t.get("releaseDate") or "")[:4] or None,
                         "duration": (ms / 1000.0) if ms else None})
         return out
+
+    def search_albums(self, q, limit=10):
+        d = _get(f"{self.api}/search?term={urllib.parse.quote(q)}&entity=album&limit={limit}")
+        return [{"source": self.name, "ref": str(a["collectionId"]),
+                 "title": a.get("collectionName") or "",
+                 "artist": a.get("artistName") or "",
+                 # Apple exposes no primary release type; a one-track collection is a single by
+                 # definition and anything longer is left unknown rather than guessed at.
+                 "kind": "single" if a.get("trackCount") == 1 else None,
+                 "tracks": a.get("trackCount")}
+                for a in d.get("results", []) if a.get("collectionId")]
 
     def search_artists(self, q, limit=8):
         d = _get(f"{self.api}/search?term={urllib.parse.quote(q)}"

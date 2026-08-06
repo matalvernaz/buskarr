@@ -720,8 +720,8 @@ def _jobs_block(conn):
         f"<td>{esc(JOB_WORDING.get(j['status'], j['status']))}</td>"
         f"<td>{esc(j['detail'] or '')}</td></tr>" for j in jobs)
     live = db.jobs_in_flight(conn)
-    caption = ("Adding a whole artist or album fetches one page per release and MusicBrainz allows "
-               "only one request a second, so it takes several seconds and runs in the background. "
+    caption = ("Adding a whole artist or album — or finding the album a song belongs to — takes "
+               "several catalogue requests, so it runs in the background. "
                + (f"{live} still in progress — reload this page to see it advance."
                   if live else "Nothing in progress."))
     return ("<h3 id=\"adds\">Adds in progress</h3>"
@@ -788,10 +788,15 @@ def wants(request: Request, msg: str = "", status: str = "", artist: str = "",
             # Both labels name the ARTIST as well as the title. Two wants can share a title — a
             # cover, or the same song by two acts — and a screen reader's controls list shows nothing
             # but the accessible name, so title-only buttons were indistinguishable there.
-            # A satisfied want gets neither button: retrying one re-downloaded the recording just to
-            # discard it against the existing copy, and the handler now refuses that anyway.
+            # A satisfied want gets neither retry nor remove: retrying one re-downloaded the
+            # recording just to discard it against the existing copy, and the handler now refuses
+            # that anyway. Its Action cell instead offers album completion — queue the rest of
+            # whatever release this song came from.
             "<td>"
-            + ("" if w["status"] == db.STATUS_HAVE else
+            + (f"<form method='post' action='/wants/{w['id']}/complete-album' class='inline'>"
+               f"<button type='submit'>Get the rest of the album for “{esc(w['title'])}” by "
+               f"{esc(w['artist'])}</button></form>"
+               if w["status"] == db.STATUS_HAVE else
                f"<form method='post' action='/wants/{w['id']}/retry' class='inline'>"
                f"<button type='submit'>Retry “{esc(w['title'])}” by {esc(w['artist'])}</button>"
                "</form>")
@@ -949,6 +954,32 @@ def remove_want(request: Request, wid: int):
     db.log_event(conn, "remove-want", f"{row['artist']} - {row['title']}", "removed by hand")
     note = f"Removed \u201c{row['artist']} - {row['title']}\u201d from the wanted list."
     return RedirectResponse(f"/wants?msg={urllib.parse.quote(note)}", status_code=303)
+
+
+@app.post("/wants/{wid}/complete-album")
+def complete_album_route(request: Request, wid: int):
+    """Queue a job to find the album this held song belongs to and add its remaining tracks.
+
+    Resolution needs catalogue HTTP, so like every add it runs in the worker; this handler only
+    enqueues. Held songs only — completing a song not yet acquired would key the album search on
+    unverified metadata, and the button is only rendered on held rows anyway.
+    """
+    conn = db.connect()
+    row = conn.execute("SELECT title, artist, status FROM wants WHERE id=?", (wid,)).fetchone()
+    if not row:
+        return RedirectResponse("/wants?msg=No+such+want.", status_code=303)
+    if row["status"] != db.STATUS_HAVE:
+        note = (f"“{row['title']}” by {row['artist']} is not in the library yet — its album can "
+                "be completed once the song itself has arrived.")
+        return RedirectResponse(f"/wants?msg={urllib.parse.quote(note)}", status_code=303)
+    dup = conn.execute("SELECT 1 FROM jobs WHERE kind='complete' AND ref=? AND status IN (?,?)",
+                       (str(wid), db.JOB_QUEUED, db.JOB_RUNNING)).fetchone()
+    if dup:
+        note = (f"Already looking for the album of “{row['title']}” — see Adds in progress "
+                "below.")
+        return RedirectResponse(f"/wants?msg={urllib.parse.quote(note)}", status_code=303)
+    return _enqueue(request, "complete", str(wid), "catalogues",
+                    f"the rest of the album of “{row['title']}” by {row['artist']}")
 
 
 @app.post("/wants/{wid}/retry")

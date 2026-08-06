@@ -382,6 +382,32 @@ def job_summary(kind, r):
     if kind == "rescan":
         return (f"{r['seen']} file(s) seen, {r['updated']} new or changed, {r['removed']} removed, "
                 f"{r['unreadable']} unreadable, {r['reconciled']} want(s) reconciled")
+    if kind == "complete":
+        outcome = r.get("outcome")
+        if outcome == "missing":
+            return "that wanted song no longer exists"
+        if outcome == "single":
+            return f"“{r['resolved']}” is a single — there is nothing further to queue"
+        if outcome == "none":
+            out = "no album containing this song was found on Deezer or Apple"
+            if r.get("errors"):
+                out += f" ({r['errors'][0]})"
+            return out
+        out = (f"resolved to “{r['album']}”"
+               + (f" ({r['year']})" if r.get("year") else "")
+               + f" via {r['source']}: ")
+        if outcome == "already":
+            out += (f"every track is already in the library or wanted "
+                    f"({r['already']} held, {r.get('existing', 0)} wanted)")
+        else:
+            out += (f"{r['added']} queued of {r['total']} remaining track(s); {r['already']} "
+                    f"already in the library; {r.get('existing', 0)} already wanted")
+        if r.get("edition_differs"):
+            out += (f" — note this is the edition “{r['resolved']}”, a different release from the "
+                    "album named on the song, so it files as its own directory")
+        if r.get("enriched"):
+            out += "; the song gained an album — run refile to move its file out of Singles"
+        return out
     if kind == "album":
         return (f"{r['added']} queued of {r['total']} track(s); {r['already']} already in the "
                 f"library; {r.get('existing', 0)} already wanted")
@@ -409,13 +435,20 @@ def run_jobs(conn):
         try:
             if j["kind"] == "album":
                 r = bulk.add_album(conn, j["ref"], j["requested_by"], source=j["source"])
+            elif j["kind"] == "complete":
+                r = bulk.complete_album(conn, int(j["ref"]), j["requested_by"])
             elif j["kind"] == "rescan":
                 # Off the request path for the same reason adds are: a post-import scan probes
                 # hundreds of files over NFS, which is minutes — far past any proxy timeout.
                 from . import scan
                 r = scan.scan(conn, LIBRARY, log=log)
-            else:
+            elif j["kind"] == "artist":
                 r = bulk.add_artist(conn, j["ref"], j["requested_by"], source=j["source"])
+            else:
+                # Refused, never guessed at. The old fallthrough ran add_artist, so any future
+                # kind — or a job left queued across a version change — became a discography add
+                # for whatever artist the catalogue matched to the ref.
+                raise ValueError(f"unknown job kind {j['kind']!r}")
         except Exception as e:
             log(f"  job {j['id']} failed: {type(e).__name__}: {e}")
             db.finish_job(conn, j["id"], db.JOB_ERROR, f"{type(e).__name__}: {e}")
@@ -424,6 +457,14 @@ def run_jobs(conn):
         detail = job_summary(j["kind"], r)
         log(f"  job {j['id']} done: {detail}")
         db.finish_job(conn, j["id"], db.JOB_DONE, detail, r.get("batch"))
+        if r.get("added"):
+            # The web route's nudge races this job: the acquisition loop can consume it, select
+            # its wants, and go back to sleep before these rows exist — leaving them idle for a
+            # whole INTERVAL. Re-nudging after the add closes that window.
+            try:
+                open(NUDGE, "w").close()
+            except OSError:
+                pass
     return len(jobs)
 
 

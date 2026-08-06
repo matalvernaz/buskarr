@@ -20,7 +20,7 @@ import uuid
 import urllib.parse
 import urllib.request
 
-from . import catalog, credit, db
+from . import catalog, credit, db, match
 
 DEEZER = "https://api.deezer.com"
 # A release most of whose tracks are already held is a repackaging, not new material.
@@ -61,26 +61,42 @@ def deezer(path):
         return json.load(fh)
 
 
-def album_tracks(album_id, source="deezer"):
-    """Return (album_title, year, [track dicts]) for one album from a catalogue source."""
+def album_detail(album_id, source="deezer"):
+    """Everything one catalogue album fetch can say: title, year, album artist, type, tracks.
+
+    The album artist and release type exist so a caller can refuse an album before queueing it —
+    a "Various Artists" compilation or a tribute act's release passes a title search happily and
+    is only visible as wrong here.
+    """
     if source == "itunes":
         d = _get(f"https://itunes.apple.com/lookup?id={album_id}&entity=song&limit=200")
         rows = d.get("results", [])
         head = next((r for r in rows if r.get("wrapperType") == "collection"), {})
-        year = (head.get("releaseDate") or "")[:4] or None
         tracks = []
         for i, t in enumerate((r for r in rows if r.get("wrapperType") == "track"), 1):
             ms = t.get("trackTimeMillis")
             tracks.append({"title": t.get("trackName"), "artist": t.get("artistName"),
                            "duration": (ms / 1000.0) if ms else None, "track_no": i})
-        return head.get("collectionName"), year, tracks
+        return {"title": head.get("collectionName"),
+                "year": (head.get("releaseDate") or "")[:4] or None,
+                "artist": head.get("artistName"),
+                # Apple has no primary type; a one-track collection is a single by definition.
+                "kind": "single" if len(tracks) == 1 else None,
+                "tracks": tracks}
     d = deezer(f"album/{album_id}")
-    year = (d.get("release_date") or "")[:4] or None
     tracks = [{"title": t.get("title"), "artist": (t.get("artist") or {}).get("name"),
                "duration": float(t.get("duration") or 0) or None,
                "track_no": i}
               for i, t in enumerate(((d.get("tracks") or {}).get("data") or []), 1)]
-    return d.get("title"), year, tracks
+    return {"title": d.get("title"), "year": (d.get("release_date") or "")[:4] or None,
+            "artist": (d.get("artist") or {}).get("name"),
+            "kind": d.get("record_type"), "tracks": tracks}
+
+
+def album_tracks(album_id, source="deezer"):
+    """Return (album_title, year, [track dicts]) for one album from a catalogue source."""
+    d = album_detail(album_id, source)
+    return d["title"], d["year"], d["tracks"]
 
 
 def _get(url):
@@ -90,19 +106,32 @@ def _get(url):
         return json.load(fh)
 
 
-def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer"):
+def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer",
+              listing=None, attribution=None, enrich=None):
     """Add every track of an album as an individual want, in one transaction.
 
     Fetched first, written second. Committing per track let the worker claim rows mid-add, past the
     point where ``db.cancel_batch`` could undo them.
+
+    ``listing`` is an optional pre-fetched ``(title, year, tracks)`` triple \u2014 a caller that already
+    fetched the album to vet it passes it here, or the two fetches can disagree.
+
+    ``attribution`` is an optional ``(album, year)`` pair written to the wants in place of the
+    fetched title and year. Album and year travel together \u2014 they describe one release, and mixing
+    a caller's album with a fetched year is how one album splits across two directories.
+
+    ``enrich`` is an optional want id given the same attribution inside the same transaction, so a
+    crash cannot queue an album while leaving the song that seeded it album-less, or vice versa.
     """
-    title, year, tracks = album_tracks(album_id, source)
+    title, year, tracks = listing if listing else album_tracks(album_id, source)
+    if attribution:
+        title, year = attribution
     if not tracks:
-        return {"album": title, "added": 0, "already": 0, "total": 0, "batch": None,
-                "source": source}
+        return {"album": title, "year": year, "added": 0, "already": 0, "existing": 0,
+                "total": 0, "batch": None, "source": source, "enriched": 0}
     batch = uuid.uuid4().hex[:10]
     label = f"album \u201c{title}\u201d ({source})"
-    added = already = existing = 0
+    added = already = existing = enriched = 0
     conn.execute("BEGIN IMMEDIATE")
     try:
         for t in tracks:
@@ -118,6 +147,8 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
                 added += 1
             else:
                 existing += 1
+        if enrich and db.enrich_want(conn, enrich, title, year, commit=False):
+            enriched = 1
         db.log_event(conn, "add-album", title,
                      f"{added} queued, {already} already held", commit=False)
         conn.commit()
@@ -125,7 +156,185 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
         conn.rollback()
         raise
     return {"album": title, "year": year, "added": added, "already": already,
-            "existing": existing, "total": len(tracks), "batch": batch, "source": source}
+            "existing": existing, "total": len(tracks), "batch": batch, "source": source,
+            "enriched": enriched}
+
+
+# How many candidate releases to fetch and inspect per catalogue before concluding a song's album
+# cannot be identified. Each costs one album fetch.
+COMPLETE_CANDIDATES = 5
+# Deezer first for the same reason it leads elsewhere; Apple fills its gaps. MusicBrainz is
+# deliberately absent: it models an album as a release-group with many differing releases, and
+# choosing one is exactly the guesswork that made an album-keyed tool unusable for this library.
+COMPLETE_SOURCES = ("deezer", "itunes")
+
+
+def _album_acceptable(detail, lead):
+    """Would completing this release be completing the SEED's album? None if yes, else the reason.
+
+    Compilations are refused outright: a track search resolves to whatever release is most popular,
+    which for a well-known song is often a "Greatest Hits" — and completing that queues a tracklist
+    nobody asked for. The album artist must be credited to the seed's lead for the same reason the
+    artist add gates on it: a tribute act's album passes a title search happily.
+    """
+    if (detail.get("kind") or "").lower() == "compilation":
+        return "a compilation"
+    artist = detail.get("artist")
+    if artist and not credit.credited_to(artist, lead):
+        return f"an album by {artist!r}, not {lead!r}"
+    return None
+
+
+def _seed_position(tracks, seed):
+    """Index of the listing track that IS the seed song, or None.
+
+    ``match.vet`` rather than the ``add_want`` duplicate key: a listing spells the held song
+    "Song (Remastered)" while the want says "Song", which are different wants by design — so
+    without this check the completion would re-download the very track that seeded it. Ties are
+    broken on duration, the strongest of the three signals.
+    """
+    fits = [i for i, t in enumerate(tracks) if match.vet(seed, t)[0]]
+    if not fits:
+        return None
+    want_dur = seed.get("duration")
+    if want_dur:
+        fits.sort(key=lambda i: abs((tracks[i].get("duration") or want_dur) - want_dur))
+    return fits[0]
+
+
+def complete_album(conn, want_id, requested_by=None):
+    """Queue the rest of the album one already-held song belongs to.
+
+    Resolution is two-tier. When the want (or its file's tags) already names an album, a catalogue
+    album search for it is trusted first — that respects the attribution deciding where the song is
+    filed today. Otherwise a track search finds the song, and the release it belongs to comes with
+    it. Either way the chosen release is fetched and must contain the seed song (``match.vet``)
+    before anything is queued: an album title plus a same-named artist is not evidence enough, and
+    feeding the gate the want's own metadata is exactly what the vetting invariant forbids.
+
+    Returns a dict whose ``outcome`` is one of ``missing``, ``single``, ``none``, ``already`` or
+    ``completed``. Raises when every catalogue call failed — an outage must finish the job as an
+    error, not as "this song has no album".
+    """
+    want = conn.execute("SELECT * FROM wants WHERE id=?", (want_id,)).fetchone()
+    if not want:
+        return {"outcome": "missing"}
+    lead = credit.lead_artist(want["artist"])
+    album, year, duration = want["album"], want["year"], want["duration"]
+    if want["file_path"]:
+        # Scan writes album tags to the files table but never back onto wants, so a song adopted
+        # from disk knows its album only here.
+        f = conn.execute("SELECT album, year, duration FROM files WHERE path=?",
+                         (want["file_path"],)).fetchone()
+        if f:
+            album, year, duration = album or f["album"], year or f["year"], \
+                duration or f["duration"]
+    seed = {"artist": want["artist"], "title": want["title"], "duration": duration}
+    errors, searched = [], 0
+    chosen = None                     # (source, ref, detail, attribution)
+
+    def inspect(ref, source):
+        """Fetch one candidate release; return its detail only if it can be completed."""
+        try:
+            detail = album_detail(ref, source)
+        except Exception as e:
+            errors.append(f"{source} album {ref}: {type(e).__name__}")
+            return None
+        why = _album_acceptable(detail, lead)
+        if why:
+            errors.append(f"skipped “{detail.get('title')}”: {why}")
+            return None
+        if _seed_position(detail["tracks"], seed) is None:
+            errors.append(f"skipped “{detail.get('title')}”: it does not contain this song")
+            return None
+        return detail
+
+    if album:
+        for source in COMPLETE_SOURCES:
+            try:
+                cands = catalog.get(source).search_albums(f"{lead} {album}")
+                searched += 1
+            except Exception as e:
+                errors.append(f"{source} album search: {type(e).__name__}")
+                continue
+            banded = []
+            for c in cands:
+                if c.get("artist") and not credit.credited_to(c["artist"], lead):
+                    continue
+                # strict_norm equality is a spelling difference of the SAME release, so the seed's
+                # attribution is reused and the new tracks join its directory. Mere norm equality
+                # ("Who I Am" against "Who I Am (Deluxe Edition)") is a different release with a
+                # different tracklist: it is queued under its own true title rather than relabelled,
+                # and the split is reported instead of papered over with false tags.
+                if db.strict_norm(c["title"]) == db.strict_norm(album):
+                    banded.append((0, c))
+                elif db.norm(c["title"]) == db.norm(album):
+                    banded.append((1, c))
+            banded.sort(key=lambda bc: bc[0])
+            for band, c in banded[:COMPLETE_CANDIDATES]:
+                detail = inspect(c["ref"], source)
+                if detail:
+                    attribution = (album, year or detail["year"]) if band == 0 else None
+                    chosen = (source, c["ref"], detail, attribution)
+                    break
+            if chosen:
+                break
+
+    if not chosen:
+        for source in COMPLETE_SOURCES:
+            try:
+                hits = catalog.get(source).search_tracks(f"{lead} {want['title']}")
+                searched += 1
+            except Exception as e:
+                errors.append(f"{source} track search: {type(e).__name__}")
+                continue
+            refs = []
+            for h in hits:
+                ref = h.get("album_ref")
+                if not ref or ref in refs:
+                    continue
+                # The hit must BE the wanted song before its album means anything — the first
+                # fuzzy search result is how a different song's album would get completed.
+                if match.vet(seed, h)[0]:
+                    refs.append(ref)
+            qualifying = []
+            for ref in refs[:COMPLETE_CANDIDATES]:
+                detail = inspect(ref, source)
+                if detail:
+                    qualifying.append((ref, detail))
+            if qualifying:
+                # A song usually lives on both its album and a single; completing "the album"
+                # means preferring the album, so the artist-add's release ranking applies.
+                qualifying.sort(key=lambda rd: (
+                    RELEASE_RANK.get((rd[1].get("kind") or "").lower(), RANK_UNKNOWN),
+                    str(rd[1].get("year") or "9999")))
+                ref, detail = qualifying[0]
+                attribution = None
+                if album and db.strict_norm(detail["title"]) == db.strict_norm(album):
+                    attribution = (album, year or detail["year"])
+                chosen = (source, ref, detail, attribution)
+                break
+
+    if not chosen:
+        if not searched and errors:
+            raise RuntimeError("no catalogue could be reached: " + "; ".join(errors[:4]))
+        return {"outcome": "none", "errors": errors}
+
+    source, ref, detail, attribution = chosen
+    tracks = list(detail["tracks"])
+    pos = _seed_position(tracks, seed)
+    if pos is not None:
+        tracks.pop(pos)
+    if not tracks:
+        return {"outcome": "single", "resolved": detail["title"], "source": source}
+    r = add_album(conn, ref, requested_by, source=source,
+                  listing=(detail["title"], detail["year"], tracks),
+                  attribution=attribution, enrich=want_id)
+    r.update({"outcome": "completed" if r["added"] else "already",
+              "resolved": detail["title"],
+              "edition_differs": bool(album) and not attribution,
+              "errors": errors})
+    return r
 
 
 def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="deezer",
