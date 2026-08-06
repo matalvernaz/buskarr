@@ -104,10 +104,10 @@ class FakeArtistSource:
         return "Test Act", self.tracks, {"complete": True}
 
 
-def trk(title, release, year, dur=100.0):
+def trk(title, release, year, dur=100.0, track_no=None):
     return {"title": title, "artist": "Test Act", "album": release, "year": year,
             "duration": dur, "release": release, "release_title": release,
-            "release_type": "album", "release_secondary": []}
+            "release_type": "album", "release_secondary": [], "track_no": track_no}
 
 
 with tempfile.TemporaryDirectory() as d:
@@ -163,6 +163,67 @@ with tempfile.TemporaryDirectory() as d:
         check("three originals plus the distinct take queued", r["added"] == 4, str(r))
     finally:
         catalog.SOURCES.clear(); catalog.SOURCES.update(real_sources)
+
+print("\n=== 4a2. an artist add numbers its wants from the listing ===")
+with tempfile.TemporaryDirectory() as d:
+    conn = db.init(os.path.join(d, "t.db"))
+    real_sources = dict(catalog.SOURCES)
+    catalog.SOURCES["fake-mb"] = FakeArtistSource([
+        trk("One", "Alb", "2001", 100.0, track_no=1),
+        trk("Two", "Alb", "2001", 110.0, track_no=2),
+        trk("Three", "Alb", "2001", 120.0, track_no=3),
+        trk("Loose", None, None, 130.0),          # no release position available
+    ])
+    try:
+        bulk.add_artist(conn, "x", source="fake-mb")
+    finally:
+        catalog.SOURCES.clear(); catalog.SOURCES.update(real_sources)
+    got = {r["title"]: r["track_no"] for r in
+           conn.execute("SELECT title, track_no FROM wants")}
+    # This is the defect the whole track_no column exists for. add_album passed the position from
+    # day one; add_artist never did, so every want from the main add path was NULL and placement
+    # fell back to the provider's own tag — six songs numbered 01 in one directory.
+    check("every listing track carries its position",
+          (got["One"], got["Two"], got["Three"]) == (1, 2, 3), str(got))
+    check("a track with no listing position stays NULL, not 1",
+          got["Loose"] is None, str(got))
+    # Filenames must then be distinct, which is the symptom Matt actually sees.
+    rows = conn.execute("SELECT * FROM wants WHERE album='Alb' ORDER BY track_no").fetchall()
+    names = [os.path.basename(worker.destination(r, ".flac")) for r in rows]
+    check("the placed filenames are distinct and contiguous",
+          names == ["01 - One.flac", "02 - Two.flac", "03 - Three.flac"], str(names))
+
+print("\n=== 4a3. two releases sharing a title cannot both number one directory ===")
+with tempfile.TemporaryDirectory() as d:
+    conn = db.init(os.path.join(d, "t.db"))
+    real_sources = dict(catalog.SOURCES)
+    # MusicBrainz lists a dozen editions of one album and Deezer carries the single and the album
+    # under one name; each numbers its own tracklist from 1, and all of them file into ONE
+    # directory. Verified live: MB returns 'Voyage' as [1,1,2,2,3,3,...].
+    album = [trk("A", "Voyage", "2024", 100.0, track_no=1),
+             trk("B", "Voyage", "2024", 110.0, track_no=2),
+             trk("C", "Voyage", "2024", 120.0, track_no=3)]
+    other_edition = [trk("A", "Voyage", "2024", 100.0, track_no=1),      # same song, deduped
+                     trk("Bonus", "Voyage", "2024", 140.0, track_no=2)]  # new, position collides
+    for t in album:
+        t["release"] = "rel-1"
+    for t in other_edition:
+        t["release"] = "rel-2"
+    catalog.SOURCES["fake-mb"] = FakeArtistSource(album + other_edition)
+    try:
+        bulk.add_artist(conn, "x", source="fake-mb")
+    finally:
+        catalog.SOURCES.clear(); catalog.SOURCES.update(real_sources)
+    got = {r["title"]: r["track_no"] for r in
+           conn.execute("SELECT title, track_no FROM wants")}
+    check("the claiming release numbers the directory", (got["A"], got["B"], got["C"]) == (1, 2, 3),
+          str(got))
+    check("a bonus track from another edition is NOT given a colliding 2",
+          got["Bonus"] is None, str(got))
+    rows = conn.execute("SELECT * FROM wants").fetchall()
+    names = sorted(os.path.basename(worker.destination(r, ".flac")) for r in rows)
+    check("no two placed filenames share a number",
+          len({n.split(" - ")[0] for n in names}) == len(names), str(names))
 
 print("\n=== 4b2. what counts as one recording relabelled ===")
 # The rule is asymmetric on purpose. A missed twin costs a duplicate download, which the audio

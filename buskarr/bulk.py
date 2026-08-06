@@ -437,12 +437,19 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
     # from wants that already exist for this artist, so a re-add whose source has since respelled
     # or re-dated a release joins the existing directory instead of opening a variant beside it —
     # one MusicBrainz respelling between two adds duplicated a whole release.
+    # Values are [spelling, year, claiming release key]. The release key matters because several
+    # releases legitimately share one title — MusicBrainz lists a dozen editions of "Voyage",
+    # Deezer carries the single and the album both called "Ends of the Earth" — and every one of
+    # them numbers its own tracklist from 1 while all of them file into ONE directory. Track
+    # numbers are therefore taken only from the release that claimed the directory's spelling;
+    # a bonus track arriving from a different edition has no position in that tracklist and is
+    # left unnumbered rather than given a colliding one.
     album_known = {}
     if wanted:
         for r in conn.execute(
                 "SELECT DISTINCT album, year FROM wants WHERE artist_lead=? AND album IS NOT NULL "
                 "ORDER BY year IS NULL, album", (db.folder_key(wanted),)):
-            album_known.setdefault(db.strict_norm(r["album"]), [r["album"], r["year"]])
+            album_known.setdefault(db.strict_norm(r["album"]), [r["album"], r["year"], None])
     capped = False
     # Albums are walked before singles, so ``seen_titles`` gives a song to its album and a single
     # only gets what no album carried. Without this the traversal order was the catalogue's, which
@@ -511,14 +518,20 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
                 # a lead-artist field through. It decides the library folder at placement time.
                 album = t.get("album") or rel_name or None
                 year = t.get("year")
+                track_no = t.get("track_no")
                 if album:
-                    entry = album_known.setdefault(db.strict_norm(album), [album, None])
+                    entry = album_known.setdefault(db.strict_norm(album),
+                                                   [album, None, rel_key])
                     # Album and year travel together — they describe one release — so adopting
                     # the known spelling adopts its year with it.
                     album = entry[0]
                     if year and not entry[1]:
                         entry[1] = year
                     year = entry[1] or year
+                    if entry[2] is None:
+                        entry[2] = rel_key
+                    if entry[2] != rel_key:
+                        track_no = None       # another release owns this directory's numbering
                 held = db.find_file(conn, t["artist"] or "", t["title"])
                 if held:
                     held_titles.add(key)
@@ -527,7 +540,8 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
                     # This is the repair path for every want made before this source could report an
                     # album: it queues nothing and downloads nothing.
                     wid = db.find_want(conn, t["artist"], t["title"])
-                    if wid and db.enrich_want(conn, wid, album, year, wanted or None, commit=False):
+                    if wid and db.enrich_want(conn, wid, album, year, wanted or None,
+                                              track_no=track_no, commit=False):
                         summary["enriched"] += 1
                     continue
                 if max_tracks and summary["added"] >= max_tracks:
@@ -537,14 +551,21 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
                 wid, created = db.add_want(
                     conn, t["artist"], t["title"], album,
                     year, t.get("duration"), requested_by,
-                    batch=batch, batch_label=label, artist_lead=wanted or None, commit=False)
+                    batch=batch, batch_label=label, artist_lead=wanted or None,
+                    # The position on the release this want is being ATTRIBUTED to. Without it
+                    # placement fell back to the downloaded file's own tag, which is its position
+                    # on whatever release the provider served — six songs numbered 01 in one
+                    # directory. add_album has passed this since the column existed; the artist
+                    # add, which is how most of this library arrived, never did.
+                    track_no=track_no, commit=False)
                 # Only a genuinely new row counts as queued; an already-pending want reported as
                 # "queued" made the summary claim work that never happened.
                 if created:
                     summary["added"] += 1
                 else:
                     summary["existing"] += 1
-                    if db.enrich_want(conn, wid, album, year, wanted or None, commit=False):
+                    if db.enrich_want(conn, wid, album, year, wanted or None,
+                                      track_no=track_no, commit=False):
                         summary["enriched"] += 1
         summary["already"] = len(held_titles)
         db.log_event(conn, "add-artist", f"{source}:{ref}",

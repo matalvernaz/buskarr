@@ -252,10 +252,15 @@ class Deezer:
                 complete = False
                 continue
             year = (d.get("release_date") or "")[:4] or None
-            for t in ((d.get("tracks") or {}).get("data") or []):
+            # Enumerated over the RAW list, exactly as bulk.album_detail does, so an artist add and
+            # a later album completion number the same release identically. Flat sequence, never a
+            # per-disc position: album directories are flat, and disc numbering would put two "05"
+            # files in one folder.
+            for pos, t in enumerate(((d.get("tracks") or {}).get("data") or []), 1):
                 if not t.get("title"):
                     continue
-                tracks.append({"artist": (t.get("artist") or {}).get("name") or name,
+                tracks.append({"track_no": pos,
+                               "artist": (t.get("artist") or {}).get("name") or name,
                                "artist_ids": [str((t.get("artist") or {}).get("id"))]
                                              if (t.get("artist") or {}).get("id") else [],
                                "title": t["title"], "album": d.get("title"),
@@ -348,8 +353,12 @@ class MusicBrainz:
         for rel in releases:
             group = rel.get("release-group") or {}
             year = (rel.get("date") or group.get("first-release-date") or "")[:4]
+            # One counter across every medium, not the track's own position: a two-disc release
+            # numbers both discs from 1, and this library files an album into one flat directory.
+            pos = 0
             for medium in (rel.get("media") or []):
                 for tr in (medium.get("tracks") or []):
+                    pos += 1
                     rec = tr.get("recording") or {}
                     title = tr.get("title") or rec.get("title")
                     if not title:
@@ -360,6 +369,7 @@ class MusicBrainz:
                     length = tr.get("length") or rec.get("length")
                     attributed.add(db.strict_norm(title))
                     tracks.append({
+                        "track_no": pos,
                         "artist": _credit(credited) or name or "",
                         "artist_ids": _credit_ids(credited),
                         "title": title,
@@ -454,11 +464,23 @@ class ITunes:
         results = d.get("results", [])
         name = next((r.get("artistName") for r in results if r.get("artistName")), None)
         songs = [t for t in results if t.get("wrapperType") == "track" and t.get("trackName")]
+        # Apple returns songs interleaved across collections and numbers each disc from 1, so the
+        # flat position has to be derived per release: order by (disc, track) and count. Album
+        # directories are flat, and a per-disc number would collide inside one of them.
+        flat = {}
+        for t in songs:
+            flat.setdefault(str(t.get("collectionId") or ""), []).append(t)
+        positions = {}
+        for rel_id, group in flat.items():
+            group.sort(key=lambda x: (x.get("discNumber") or 1, x.get("trackNumber") or 0))
+            for i, t in enumerate(group, 1):
+                positions[id(t)] = i
         tracks = []
         for t in songs:
             ms = t.get("trackTimeMillis")
             year = (t.get("releaseDate") or "")[:4]
-            tracks.append({"artist": t.get("artistName") or name,
+            tracks.append({"track_no": positions.get(id(t)),
+                           "artist": t.get("artistName") or name,
                            "artist_ids": [str(t["artistId"])] if t.get("artistId") else [],
                            "title": t["trackName"],
                            "album": t.get("collectionName"),
