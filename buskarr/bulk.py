@@ -141,22 +141,13 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
     batch = uuid.uuid4().hex[:10]
     label = f"album \u201c{title}\u201d ({source})"
     added = already = existing = enriched = 0
-    twins = {} if allow_dup else _twin_index(conn, title)
     conn.execute("BEGIN IMMEDIATE")
     try:
         for t in tracks:
             if not t["title"] or not t["artist"]:
                 continue
-            twin = _twin_want(twins, t)
-            if twin:
-                if db.enrich_want(conn, twin["id"], title, year,
-                                  track_no=t.get("track_no"), commit=False):
-                    enriched += 1
-                if twin["status"] == db.STATUS_HAVE:
-                    already += 1
-                else:
-                    existing += 1
-                continue
+            # An edition-noise variant of a want that already exists comes back from add_want as
+            # that want (created=False), so the enrichment and counting below cover it.
             wid, created = db.add_want(conn, t["artist"], t["title"], title, year,
                                        t["duration"], requested_by, allow_dup=allow_dup,
                                        batch=batch, batch_label=label,
@@ -185,22 +176,9 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
             "enriched": enriched}
 
 
-# A listing track and an existing want are the same recording when their durations agree this
-# tightly (dedupe's rule) and their titles are equivalent under the folds below. Deliberately
-# tighter than match.acceptable_delta: claiming a want is destructive-adjacent, so the gate is
-# the strict one.
-TWIN_DURATION = 4.0
-
-
-def _word_fold(s):
-    """strict_norm with parentheses dissolved into spaces: 'Song (Chiptune)' == 'Song - Chiptune'.
-
-    Complements db.norm for twin detection. norm STRIPS a parenthetical, equating
-    "(2023 Version)" with "(2023 re-recorded version)" only by dropping both — which also drops
-    "Chiptune", so the dash-suffix spelling of the same word never matched. Folding the
-    parentheses keeps the words and dissolves only the punctuation.
-    """
-    return " ".join(db.strict_norm(s).replace("(", " ").replace(")", " ").split())
+# Identity of a recording across edition labels lives in db, so every caller shares one rule.
+TWIN_DURATION = db.TWIN_DURATION
+_word_fold = db.word_fold
 
 
 def _remember_recording(seen, t):
@@ -226,47 +204,6 @@ def _release_twin(seen, t):
         for prev in seen.get(k, []):
             if prev.get("duration") and abs(prev["duration"] - dur) <= TWIN_DURATION:
                 return prev
-    return None
-
-
-def _twin_index(conn, album):
-    """Existing wants of this release, keyed by both title folds, for ``add_album``'s twin gate."""
-    twins = {}
-    target = db.strict_norm(album or "")
-    if not target:
-        return twins
-    for w in conn.execute(
-            "SELECT w.id, w.title, w.artist, w.album, w.status, w.duration, "
-            "f.duration AS fdur FROM wants w LEFT JOIN files f ON f.path = w.file_path "
-            "WHERE w.album IS NOT NULL"):
-        if db.strict_norm(w["album"]) != target:
-            continue
-        for k in {db.norm(w["title"]), _word_fold(w["title"])}:
-            twins.setdefault(k, []).append(w)
-    return twins
-
-
-def _twin_want(twins, t):
-    """The existing want that IS this listing track under another spelling, or None.
-
-    Same release (the index is album-scoped), duration within TWIN_DURATION, compatible credits,
-    and a title equal under either fold. Exists because one respelled catalogue listing
-    re-downloaded seventeen held recordings: the seed is vetted fuzzily by ``_seed_position``,
-    but every other listing track was deduplicated on the strict title alone, so "(Chiptune)"
-    against "- Chiptune" and "(2023 Version)" against "(2023 re-recorded version)" both queued
-    fresh downloads of audio already on disk.
-    """
-    dur = t.get("duration")
-    if not dur or not twins:
-        return None
-    for k in {db.norm(t["title"]), _word_fold(t["title"])}:
-        for w in twins.get(k, []):
-            held = w["duration"] or w["fdur"]
-            if not held or abs(held - dur) > TWIN_DURATION:
-                continue
-            if credit.credited_to(t["artist"], credit.lead_artist(w["artist"])) \
-                    or credit.credited_to(w["artist"], credit.lead_artist(t["artist"])):
-                return w
     return None
 
 

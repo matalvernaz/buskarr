@@ -324,6 +324,134 @@ def strict_norm(s):
     return re.sub(r"[^a-z0-9()]+", " ", s).strip()
 
 
+# How closely two running times must agree before an edition-noise title match is believed to be
+# the same recording. A genuinely different take of one song is a different length; a reissue of
+# one master is not. Tighter than match.acceptable_delta on purpose — this decides whether to
+# refuse an addition, so a false positive costs the user something they asked for.
+TWIN_DURATION = 4.0
+
+
+def word_fold(s):
+    """``strict_norm`` with parentheses dissolved, so a suffix and a parenthetical compare equal.
+
+    ``Song (Chiptune)`` and ``Song - Chiptune`` name one recording; ``norm`` equates them only by
+    throwing the word away entirely, which also equates them with plain ``Song``. Folding the
+    punctuation keeps the words and drops only the bracketing.
+    """
+    return " ".join(strict_norm(s).replace("(", " ").replace(")", " ").split())
+
+
+# Words that describe how a release was PACKAGED. Stripping them cannot change which performance
+# a title names, so two titles equal after their removal are one recording relabelled.
+EDITION_NOISE = re.compile(
+    r"\b(?:re-?master(?:ed)?|remasters?|\d{4}|version|ver|edit|edition|deluxe|anniversary|"
+    r"expanded|bonus|explicit|clean|censored|mono|stereo|album|single|radio|original|extended|"
+    r"mix|reissue|digital|hd|remix(?:ed)?ing)\b")
+
+# Words that describe a distinct PERFORMANCE. A title carrying one of these that its counterpart
+# lacks is a different recording, however close the running times happen to fall. These are why
+# bare ``norm`` cannot be used to detect twins: it strips every parenthetical, so it read
+# "Pants Drunk (Electric Timebomb remix)" as a relabelling of "Pants Drunk", and a remix, a demo
+# and a live take would all have been refused as duplicates of the studio cut.
+PERFORMANCE_WORDS = frozenset(
+    "live remix demo acoustic instrumental reprise karaoke cover unplugged session rehearsal "
+    "acapella acappella cappella orchestral chiptune symphonic dub alternate outtake "
+    "rerecorded".split())
+
+
+def edition_fold(s):
+    """Title reduced to the words that identify the PERFORMANCE, edition packaging removed.
+
+    ``strict_norm`` has already turned "re-recorded" into two words, so it is rejoined first —
+    otherwise "recorded" survives as an unmatched token and a re-recording looks like a
+    relabelling of the original.
+    """
+    folded = word_fold(s).replace("re recorded", "rerecorded")
+    return tuple(sorted(w for w in EDITION_NOISE.sub(" ", folded).split() if w))
+
+
+def _same_recording(title_a, title_b, dur_a, dur_b, tolerance=TWIN_DURATION):
+    """Do these two name one recording differing only by an edition label?
+
+    Three conditions, and all of them are needed. The running times must be known and agree,
+    because a genuinely different take is a different length. The titles must be equal once
+    edition packaging is stripped. And neither may carry a performance word the other lacks —
+    duration alone does not settle it, since a remix can land within a second of its original.
+    """
+    if not dur_a or not dur_b or abs(dur_a - dur_b) > tolerance:
+        return False
+    if edition_fold(title_a) != edition_fold(title_b):
+        return False
+    def perf(t):
+        words = word_fold(t).replace("re recorded", "rerecorded").split()
+        return {w for w in words if w in PERFORMANCE_WORDS}
+
+    return perf(title_a) == perf(title_b)
+
+
+def _credit_kin(artist_a, artist_b):
+    """True when either credit is led by the other — "Act" against "Act & Guest"."""
+    from . import credit
+    return (credit.credited_to(artist_a, credit.lead_artist(artist_b))
+            or credit.credited_to(artist_b, credit.lead_artist(artist_a)))
+
+
+# Candidate credits for a twin lookup. Equality alone is not enough: a want credited
+# "Act & Guest" normalises to "act guest", and lead_artist deliberately never splits on "&", so
+# neither its norm_artist nor its artist_lead equals a listing's plain "Act". The prefix clauses
+# run in both directions to catch a collaboration either side; credit._loose via _credit_kin is
+# what actually decides, this only narrows the scan.
+_KIN_SQL = ("norm_artist=:na OR norm_artist LIKE :na || ' %' OR :na LIKE norm_artist || ' %' "
+            "OR artist_lead=:lead")
+
+
+def find_want_twin(conn, artist, title, duration, exclude=None):
+    """An existing want that IS this recording under a different edition label, or None.
+
+    Artist-scoped, not release-scoped. A release-scoped check cannot see that the
+    "Song (2010 Remaster)" on a greatest-hits album is the "Song" already wanted from the
+    original album, so adding the compilation separately queued the same master again.
+    """
+    if not duration:
+        return None
+    rows = conn.execute(
+        f"SELECT * FROM wants WHERE {_KIN_SQL}",
+        {"na": norm(artist), "lead": folder_key(_lead(artist))}).fetchall()
+    for r in rows:
+        if exclude and r["id"] == exclude:
+            continue
+        if strict_norm(r["title"]) == strict_norm(title):
+            continue          # the exact key already covers this; not an edition variant
+        if _same_recording(title, r["title"], duration, r["duration"]) \
+                and _credit_kin(artist, r["artist"]):
+            return r
+    return None
+
+
+def find_recording(conn, artist, title, duration):
+    """A held FILE that is this recording under a different edition label, or None.
+
+    ``find_exact`` compares strict titles, so a file held as "Song" is invisible to an addition
+    spelled "Song (2016 Remaster)" — which is how one master arrived on disk several times.
+    """
+    if not duration:
+        return None
+    rows = conn.execute(
+        f"SELECT * FROM files WHERE {_KIN_SQL}",
+        {"na": norm(artist), "lead": folder_key(_lead(artist))}).fetchall()
+    for r in rows:
+        for cand in (r["file_title"], r["title"]):
+            if cand and strict_norm(cand) != strict_norm(title) \
+                    and _same_recording(title, cand, duration, r["duration"]):
+                return r
+    return None
+
+
+def _lead(artist):
+    from . import credit
+    return credit.lead_artist(artist)
+
+
 def find_exact(conn, artist, title, duration=None, tolerance=4.0):
     """Find a file that is the SAME RECORDING — strict title plus agreeing duration.
 
@@ -405,7 +533,16 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
                             (na, nt)).fetchone()
     if existing:
         return existing["id"], False
-    have = None if allow_dup else find_exact(conn, artist, title, duration)
+    if not allow_dup:
+        # The same master relabelled is not a second song. Every bulk path grew its own guard
+        # against this after one provider served one recording to every edition-variant want;
+        # putting it here means the manual Add form and any future caller inherit it too.
+        # allow_dup remains the way to ask for a second copy deliberately.
+        twin = find_want_twin(conn, artist, title, duration)
+        if twin:
+            return twin["id"], False
+    have = None if allow_dup else (find_exact(conn, artist, title, duration)
+                                   or find_recording(conn, artist, title, duration))
     cur = conn.execute(
         "INSERT INTO wants (artist,title,norm_artist,norm_title,album,year,duration,track_no,"
         "requested_by,requested_at,status,file_path,allow_dup,note,batch,batch_label,artist_lead) "

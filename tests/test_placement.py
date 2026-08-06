@@ -164,6 +164,93 @@ with tempfile.TemporaryDirectory() as d:
     finally:
         catalog.SOURCES.clear(); catalog.SOURCES.update(real_sources)
 
+print("\n=== 4b2. what counts as one recording relabelled ===")
+# The rule is asymmetric on purpose. A missed twin costs a duplicate download, which the audio
+# sweep finds later; a wrong twin silently refuses something Matt asked for. So only PACKAGING
+# words collapse, and any word that could name a different performance keeps the two apart even
+# when the running times match — a remix can land a second from its original.
+TWIN_CASES = [
+    ("Song A", "Song A (2010 Remaster)", 200, 200, True, "remaster"),
+    ("Chattahoochee (extended mix 2)", "Chattahoochee [extended mix 2] [*]", 246, 246, True,
+     "bracket style only"),
+    ("Second Song - Chiptune", "Second Song (Chiptune)", 150, 151, True,
+     "dash suffix vs parenthetical"),
+    ("Song A", "Song A (Radio Edit)", 172, 173, True, "radio edit is packaging"),
+    ("Song A", "Song A (Explicit)", 200, 200, True, "explicit label"),
+    ("Pants Drunk", "Pants Drunk (Electric Timebomb remix)", 228, 230, False, "a remix"),
+    ("F'n It Up", "F'n It Up (Home Demo)", 219, 222, False, "a demo"),
+    ("Money N Bitches", "Money N Bitches (Live 2023)", 209, 208, False, "a live take"),
+    ("Anne Louise", "Anne Louise (2023 re-recorded version)", 149, 149, False, "a re-recording"),
+    ("Wellerman", "Wellerman (Community version)", 142, 142, False, "a community version"),
+    ("Song A", "Song A (Acoustic)", 200, 200, False, "acoustic"),
+    ("Song A", "Song A (Karaoke Mix)", 200, 200, False, "karaoke"),
+    ("Song A", "Song A (Live at Wembley)", 200, 265, False, "lengths disagree"),
+    ("Intro", "Outro", 30, 30, False, "different songs, same length"),
+]
+for a, b, da, dbb, expect, why in TWIN_CASES:
+    got = db._same_recording(a, b, da, dbb)
+    check(f"{'twin' if expect else 'distinct'}: {why}", got == expect,
+          f"got twin={got} for {a!r} vs {b!r}")
+
+print("\n=== 4c. add_want's twin gate: edition noise never becomes a second want ===")
+with tempfile.TemporaryDirectory() as d:
+    conn = db.init(os.path.join(d, "t.db"))
+    real_sources = dict(catalog.SOURCES)
+    catalog.SOURCES["fake-mb"] = FakeArtistSource([
+        trk("Song A", "First Album", "2001"), trk("Intro", "First Album", "2001", 30.0)])
+    try:
+        bulk.add_artist(conn, "x", source="fake-mb")
+    finally:
+        catalog.SOURCES.clear(); catalog.SOURCES.update(real_sources)
+
+
+    def n_wants():
+        return conn.execute("SELECT COUNT(*) FROM wants").fetchone()[0]
+
+    # A compilation added on its own, months later. The old gate was release-scoped and could not
+    # see that this remaster is the master already wanted from the original album.
+    base, real_detail = n_wants(), bulk.album_detail
+    bulk.album_detail = lambda ref, source="deezer": {
+        "title": "Greatest Hits", "year": "2010", "artist": "Test Act", "kind": "album",
+        "tracks": [{"title": "Song A (2010 Remaster)", "artist": "Test Act",
+                    "duration": 100.0, "track_no": 1},
+                   {"title": "Brand New Song", "artist": "Test Act",
+                    "duration": 175.0, "track_no": 2}]}
+    try:
+        r = bulk.add_album(conn, "99", source="deezer")
+    finally:
+        bulk.album_detail = real_detail
+    check("a later compilation does not re-queue a held master",
+          r["added"] == 1 and n_wants() == base + 1, str(r))
+    check("its genuinely new track still queues",
+          db.find_want(conn, "Test Act", "Brand New Song") is not None)
+
+    before = n_wants()
+    wid, created = db.add_want(conn, "Test Act", "Song A (2016 Remaster)", None, None, 100.0)
+    check("the manual Add form returns the existing want, not a new one",
+          not created and n_wants() == before and wid == db.find_want(conn, "Test Act", "Song A"),
+          f"created={created} wid={wid}")
+
+    # Everything below must STILL be addable: the gate keys on duration agreement, so a real
+    # alternate take survives, and allow_dup remains the deliberate override.
+    before = n_wants()
+    checks = [
+        ("a different-LENGTH take of the same song",
+         db.add_want(conn, "Test Act", "Song A (Live at Wembley)", None, None, 265.0)[1]),
+        ("allow_dup still forces a second copy",
+         db.add_want(conn, "Test Act", "Song A (Acoustic)", None, None, 100.0,
+                     allow_dup=True)[1]),
+        ("the same title by a DIFFERENT artist",
+         db.add_want(conn, "Other Act", "Song A (2010 Remaster)", None, None, 100.0)[1]),
+        ("a different song that happens to share a duration",
+         db.add_want(conn, "Test Act", "Outro", None, None, 30.0)[1]),
+        ("a want with no duration at all",
+         db.add_want(conn, "Test Act", "Song B", None, None, None)[1]),
+    ]
+    for label, ok in checks:
+        check(label + " is still added", ok)
+    check("all five landed", n_wants() == before + 5, f"{n_wants() - before}")
+
 print("\n=== 5. track number: the want's listing position beats the source file's tag ===")
 w = {"artist": "A", "title": "Song", "album": "Alb", "year": "2003", "track_no": 4}
 check("want track_no wins over the source tag",
