@@ -137,6 +137,33 @@ with tempfile.TemporaryDirectory() as d:
     finally:
         catalog.SOURCES.clear(); catalog.SOURCES.update(real_sources)
 
+print("\n=== 4b. a first-time add does not fetch album + deluxe + hits of one master ===")
+with tempfile.TemporaryDirectory() as d:
+    conn = db.init(os.path.join(d, "t.db"))
+    real_sources = dict(catalog.SOURCES)
+    # Nothing held: the on-disk repackaging guard cannot fire, which is exactly the case that
+    # downloaded Wheeler Walker's catalogue three times over.
+    catalog.SOURCES["fake-mb"] = FakeArtistSource([
+        trk("Redneck Shit", "Redneck Shit", "2016", 144.0),
+        trk("Family Tree", "Redneck Shit", "2016", 200.0),
+        trk("Live Cut", "Redneck Shit", "2016", 150.0),
+        trk("Redneck Shit (2016 Remaster)", "Redneck Shit (Deluxe)", "2020", 144.0),
+        trk("Family Tree (Remastered 2020)", "Redneck Shit (Deluxe)", "2020", 200.0),
+        # Same title, genuinely different take — must NOT collapse.
+        trk("Live Cut (live)", "Redneck Shit (Deluxe)", "2020", 233.0),
+    ])
+    try:
+        r = bulk.add_artist(conn, "x", source="fake-mb")
+        titles = {x["title"] for x in conn.execute("SELECT title FROM wants")}
+        check("remastered reissues of held masters not re-queued",
+              "Redneck Shit (2016 Remaster)" not in titles
+              and "Family Tree (Remastered 2020)" not in titles, str(sorted(titles)))
+        check("a different-length take of the same title survives",
+              "Live Cut (live)" in titles and "Live Cut" in titles, str(sorted(titles)))
+        check("three originals plus the distinct take queued", r["added"] == 4, str(r))
+    finally:
+        catalog.SOURCES.clear(); catalog.SOURCES.update(real_sources)
+
 print("\n=== 5. track number: the want's listing position beats the source file's tag ===")
 w = {"artist": "A", "title": "Song", "album": "Alb", "year": "2003", "track_no": 4}
 check("want track_no wins over the source tag",

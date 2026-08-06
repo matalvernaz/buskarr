@@ -203,6 +203,32 @@ def _word_fold(s):
     return " ".join(db.strict_norm(s).replace("(", " ").replace(")", " ").split())
 
 
+def _remember_recording(seen, t):
+    """Record a claimed listing track under both title folds, for ``_release_twin``."""
+    for k in {db.norm(t["title"] or ""), _word_fold(t["title"] or "")}:
+        seen.setdefault(k, []).append(t)
+
+
+def _release_twin(seen, t):
+    """A track already claimed in this add that IS this recording, or None.
+
+    Same song under edition noise: ``db.norm`` drops the parenthetical and the remaster
+    keywords, so "Redneck Shit (2016 Remaster)" reduces to the plain title. That is too loose on
+    its own — it also equates "(live)" with the studio take — so the running times must agree as
+    well. A different take is a different length and survives; a relabelled reissue of one master
+    does not, which is what stopped a first-time artist add downloading its album, its deluxe and
+    its greatest-hits in full.
+    """
+    dur = t.get("duration")
+    if not dur:
+        return None
+    for k in {db.norm(t["title"] or ""), _word_fold(t["title"] or "")}:
+        for prev in seen.get(k, []):
+            if prev.get("duration") and abs(prev["duration"] - dur) <= TWIN_DURATION:
+                return prev
+    return None
+
+
 def _twin_index(conn, album):
     """Existing wants of this release, keyed by both title folds, for ``add_album``'s twin gate."""
     twins = {}
@@ -462,6 +488,9 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
     summary["releases"] = len(by_release)
 
     seen_titles, held_titles = set(), set()
+    # Recordings this add has already claimed, keyed loosely so an edition-noise respelling of
+    # one already claimed is recognisable. See _release_twin.
+    seen_recordings = {}
     # One album, one spelling, one year, one directory. Keyed on strict_norm, never db.norm:
     # norm strips parentheticals, so "Bones in the Ocean (10 Year Anniversary Edition)" shared a
     # year slot with "Bones in the Ocean" and the edition was stamped with the base album's year.
@@ -507,6 +536,11 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
                 continue
             queue_new = True
             if skip_repackagings and rel_key and len(by_release) > 1:
+                # Deliberately still counted against what is held ON DISK only. Counting tracks
+                # claimed earlier in this same add tips a deluxe edition over the threshold, and
+                # a release skipped here is skipped WHOLE — which discards its genuine bonus
+                # tracks. Duplicate masters inside one add are the per-track twin check's job
+                # below, which drops exactly the repeats and keeps everything new.
                 hits = [t for t in own if db.find_file(conn, t["artist"] or "", t["title"])]
                 if len(hits) / len(own) > REPACKAGE_OVERLAP:
                     summary["skipped_repackaging"] += 1
@@ -525,7 +559,16 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
                 key = db.strict_norm(t["title"])
                 if key in seen_titles:
                     continue
+                # Edition noise is not a different song. strict_norm preserves parentheticals —
+                # right for "(live)" and "(reprise)", wrong for "(2016 Remaster)",
+                # "(Community version)" and "(A Tribute to …)", which named the SAME recording:
+                # each queued its own want, and the provider returned one recording for all of
+                # them. Duration is what separates the two cases, so a norm-equal title only
+                # collapses when the running times agree; a genuinely different take survives.
+                if _release_twin(seen_recordings, t):
+                    continue
                 seen_titles.add(key)
+                _remember_recording(seen_recordings, t)
                 # Every track that got here passed the credit gate, so the wanted artist IS the lead
                 # credit — no separate inference needed, and none of the three sources has to plumb
                 # a lead-artist field through. It decides the library folder at placement time.
