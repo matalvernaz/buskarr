@@ -93,13 +93,28 @@ def folder_artist(want):
     return credit.lead_artist(want["artist"], dict(want).get("artist_lead"))
 
 
+def want_track(want, fallback=None):
+    """The track number to name and tag a want's file with: the want's own, else ``fallback``.
+
+    A want created from a resolved album listing knows its position on THAT release. The acquired
+    file's tag carries its position on whatever release the provider happened to serve — a
+    compilation or another edition often enough that one completed album got two "05" files and no
+    "04". The listing wins; the source tag stays the fallback for wants that never had a listing.
+    ``dict()`` because this is called with both database rows and plain dicts, and older callers'
+    dicts have no ``track_no`` key at all.
+    """
+    return dict(want).get("track_no") or fallback
+
+
 def destination(want, ext, track=None):
     """Library path for a want: ``<Lead artist>/<Album> (<Year>)/NN - Title.ext``.
 
-    ``track`` comes from the acquired file's own tags where the source supplies one. Hardcoding 01
-    left filenames claiming track 1 while the embedded tag said 14, and the scanner reads the track
-    number from either — so they have to agree.
+    ``track`` comes from the acquired file's own tags where the source supplies one; the want's
+    own ``track_no`` overrides it (see ``want_track``). Hardcoding 01 left filenames claiming
+    track 1 while the embedded tag said 14, and the scanner reads the track number from either —
+    so filename and tag have to agree, which holds because ``tag`` applies the same preference.
     """
+    track = want_track(want, track)
     # A directory is unavoidable; "Singles" groups album-less tracks instead of creating one
     # single-track pseudo-album per song.
     real_album = bool(want["album"])
@@ -215,7 +230,11 @@ def tag(path, want, track=None):
     ``artist`` is the full credit and ``albumartist`` the lead. Both are needed and they are not
     interchangeable: the full credit is what identity, reconciliation and provider search all key on,
     while the lead is what groups a collaboration with the rest of that artist's work.
+
+    ``track`` resolves exactly as in ``destination`` — the want's own number first — so the
+    filename and the embedded tag never disagree.
     """
+    track = want_track(want, track)
     ext = os.path.splitext(path)[1].lower()
     lead = folder_artist(want)
     try:
@@ -406,7 +425,8 @@ def job_summary(kind, r):
             out += (f" — note this is the edition “{r['resolved']}”, a different release from the "
                     "album named on the song, so it files as its own directory")
         if r.get("enriched"):
-            out += "; the song gained an album — run refile to move its file out of Singles"
+            out += (f"; {r['enriched']} song(s) gained album details — run refile to move any "
+                    "already-placed file(s)")
         return out
     if kind == "album":
         return (f"{r['added']} queued of {r['total']} track(s); {r['already']} already in the "

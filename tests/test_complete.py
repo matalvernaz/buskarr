@@ -90,11 +90,17 @@ with tempfile.TemporaryDirectory() as d:
         r = bulk.complete_album(conn, wid)
         check("outcome completed", r["outcome"] == "completed", str(r))
         check("two tracks queued, seed excluded", r["added"] == 2 and r["total"] == 2, str(r))
-        rows = conn.execute("SELECT title, album, year FROM wants ORDER BY id").fetchall()
+        rows = conn.execute("SELECT title, album, year, track_no FROM wants ORDER BY id").fetchall()
         check("no second want for the seed song", len(rows) == 3, str([r_["title"] for r_ in rows]))
         check("new wants carry the SEED's spelling and year",
               all(x["album"] == "Who I Am" and x["year"] == "1994" for x in rows[1:]),
               str([(x["album"], x["year"]) for x in rows]))
+        # Positions are the release's own, NOT renumbered after the seed was popped — renumbering
+        # is how "track 4" becomes a second "track 5" on disk.
+        check("queued wants keep their listing positions (no renumber past the seed)",
+              [x["track_no"] for x in rows[1:]] == [2, 3],
+              str([(x["title"], x["track_no"]) for x in rows]))
+        check("seed want learned its own position", rows[0]["track_no"] == 1, str(dict(rows[0])))
         check("edition_differs not set", not r["edition_differs"])
     finally:
         catalog.SOURCES.update(REAL_SOURCES)
@@ -119,6 +125,10 @@ with tempfile.TemporaryDirectory() as d:
         check("edition difference reported", r["edition_differs"] is True)
         check("summary mentions the edition",
               "different release" in worker.job_summary("complete", r))
+        # The seed is attributed to "Who I Am"; its position on the DELUXE is a different
+        # release's fact and must not be stamped onto it.
+        check("seed gains no track number from a different edition",
+              conn.execute("SELECT track_no FROM wants WHERE id=?", (wid,)).fetchone()[0] is None)
     finally:
         catalog.SOURCES.update(REAL_SOURCES)
         bulk.album_detail = REAL_DETAIL
@@ -255,6 +265,9 @@ with tempfile.TemporaryDirectory() as d:
         check("nothing new to queue reports already",
               r["outcome"] == "already" and r["added"] == 0, str(r))
         check("already summary renders", "already" in worker.job_summary("complete", r))
+        check("an already-wanted track was enriched with its position",
+              conn.execute("SELECT track_no FROM wants WHERE title='Second Song'")
+              .fetchone()[0] == 2)
     finally:
         catalog.SOURCES.update(REAL_SOURCES)
         bulk.album_detail = REAL_DETAIL

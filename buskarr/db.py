@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS wants (
     album         TEXT,
     year          TEXT,
     duration      REAL,
+    track_no      INTEGER,
     requested_by  TEXT,
     requested_at  REAL,
     status        TEXT NOT NULL DEFAULT 'pending',
@@ -188,6 +189,11 @@ MIGRATIONS = [
     # empty or spelled differently splits an artist there while looking correct here. Recorded so
     # repair can see the disagreement.
     ("files", "album_artist", "TEXT"),
+    # The song's position on the release named in `album`, when a catalogue listing supplied it.
+    # Without it, placement numbered files from the acquired file's own tag — the position on
+    # whatever release the provider happened to serve — which gave one completed album two
+    # "05" files and no "04".
+    ("wants", "track_no", "INTEGER"),
 ]
 
 
@@ -370,7 +376,8 @@ def find_file(conn, artist, title, duration=None, tolerance=4.0):
 
 
 def add_want(conn, artist, title, album=None, year=None, duration=None, requested_by=None,
-             allow_dup=False, batch=None, batch_label=None, artist_lead=None, commit=True):
+             allow_dup=False, batch=None, batch_label=None, artist_lead=None, track_no=None,
+             commit=True):
     """Register a wanted song. Returns (id, created).
 
     Unless ``allow_dup``, an addition whose recording is already on disk is recorded as already
@@ -380,6 +387,10 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
     ``artist_lead`` is the lead credit where the caller knows it — "The Longest Johns" for a track
     credited "The Longest Johns & Lucy Humphris". Optional: a hand-typed want has no catalogue to ask,
     and the placement path falls back to trimming the credit itself.
+
+    ``track_no`` is the song's position on ``album`` — the pair describe the same release, like
+    ``album`` and ``year`` do. Placement prefers it to the acquired file's own tag, whose number
+    is the position on whatever release the provider served.
     """
     # Wants are keyed on the STRICT title. norm() strips parentheticals, which would make
     # "Song" and "Song (live)" the same want and silently refuse the second — they are different
@@ -396,10 +407,10 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
         return existing["id"], False
     have = None if allow_dup else find_exact(conn, artist, title, duration)
     cur = conn.execute(
-        "INSERT INTO wants (artist,title,norm_artist,norm_title,album,year,duration,"
+        "INSERT INTO wants (artist,title,norm_artist,norm_title,album,year,duration,track_no,"
         "requested_by,requested_at,status,file_path,allow_dup,note,batch,batch_label,artist_lead) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (artist, title, na, nt, album, year, duration, requested_by, time.time(),
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (artist, title, na, nt, album, year, duration, track_no, requested_by, time.time(),
          STATUS_HAVE if have else STATUS_PENDING, have["path"] if have else None,
          1 if allow_dup else 0,
          "already on disk" if have else ("extra copy requested" if allow_dup else None),
@@ -464,7 +475,8 @@ def find_want(conn, artist, title):
     return r["id"] if r else None
 
 
-def enrich_want(conn, want_id, album=None, year=None, artist_lead=None, commit=True):
+def enrich_want(conn, want_id, album=None, year=None, artist_lead=None, track_no=None,
+                commit=True):
     """Fill in facts a want was created without. Returns True if anything changed.
 
     Only ever fills NULLs — an existing value is the user's or an earlier catalogue's and is not
@@ -473,7 +485,7 @@ def enrich_want(conn, want_id, album=None, year=None, artist_lead=None, commit=T
     Every MusicBrainz artist add before the release-browse fix produced album-less wants, and the
     whole discography was filed under "Singles" as a result.
     """
-    row = conn.execute("SELECT album, year, artist_lead FROM wants WHERE id=?",
+    row = conn.execute("SELECT album, year, artist_lead, track_no FROM wants WHERE id=?",
                        (want_id,)).fetchone()
     if row is None:
         return False
@@ -487,6 +499,14 @@ def enrich_want(conn, want_id, album=None, year=None, artist_lead=None, commit=T
     elif year and not row["year"]:
         sets.append("year=?")
         args.append(year)
+    if track_no and not row["track_no"] and album:
+        # A track number is a fact about ONE release, so it is only written alongside the album it
+        # belongs to: either the album being filled in above, or one the row already names with the
+        # same spelling. Filling it against a row attributed to a different release would number the
+        # file from the wrong tracklist — the very defect this column exists to close.
+        if not row["album"] or strict_norm(row["album"]) == strict_norm(album):
+            sets.append("track_no=?")
+            args.append(track_no)
     if artist_lead and not row["artist_lead"]:
         # folder_key here too. This was the one writer that skipped it, so an enrichment that won a
         # race against the backfill left a raw credit in a column every other path stores sanitised.

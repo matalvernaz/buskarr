@@ -36,6 +36,8 @@ with tempfile.TemporaryDirectory() as d:
         conn = db.init(os.path.join(d, "fresh.db"))
         n = conn.execute("SELECT COUNT(*) FROM wants").fetchone()[0]
         check("db.init() on an empty volume", True, f"wants table present, {n} rows")
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(wants)")}
+        check("wants.track_no present after init", "track_no" in cols)
         # And it must still be idempotent on a second open.
         conn2 = db.init(os.path.join(d, "fresh.db"))
         check("second init on the same file", True)
@@ -85,7 +87,22 @@ check("real year arrives -> 1994", resolve("Who I Am", "1994") == "1994")
 check("later dateless track inherits 1994", resolve("Who I Am", None) == "1994")
 check("a later reissue does not override", resolve("Who I Am", "2003") == "1994")
 
-print("\n=== 5. release ordering still albums-first ===")
+print("\n=== 5. track number: the want's listing position beats the source file's tag ===")
+w = {"artist": "A", "title": "Song", "album": "Alb", "year": "2003", "track_no": 4}
+check("want track_no wins over the source tag",
+      worker.destination(w, ".flac", 5).endswith("/04 - Song.flac"),
+      worker.destination(w, ".flac", 5))
+w_less = {"artist": "A", "title": "Song", "album": "Alb", "year": "2003"}
+check("no want number falls back to the source tag",
+      worker.destination(w_less, ".flac", 5).endswith("/05 - Song.flac"))
+check("NULL want number falls back too",
+      worker.destination(dict(w, track_no=None), ".flac", 7).endswith("/07 - Song.flac"))
+check("neither number falls back to 01",
+      worker.destination(w_less, ".flac", None).endswith("/01 - Song.flac"))
+check("want_track and destination agree (tag uses the same helper)",
+      worker.want_track(w, 5) == 4 and worker.want_track(w_less, 5) == 5)
+
+print("\n=== 6. release ordering still albums-first ===")
 buckets = {
     "single": [{"release_type": "Single", "release_secondary": [], "year": "1989"}],
     "album": [{"release_type": "Album", "release_secondary": [], "year": "1990"}],

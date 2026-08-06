@@ -47,6 +47,7 @@ def candidates(conn, artist=None, limit=DEFAULT_LIMIT):
     """
     sql = ("SELECT w.id AS wid, w.artist AS artist, w.title AS title, w.album AS album,"
            " w.year AS year, w.artist_lead AS artist_lead, w.file_path AS path,"
+           " w.track_no AS want_track,"
            " f.codec AS codec, f.bitrate AS bitrate, f.sample_rate AS sample_rate,"
            " f.bit_depth AS bit_depth, f.duration AS fdur, f.track_no AS track_no"
            " FROM wants w JOIN files f ON f.path = w.file_path"
@@ -113,8 +114,11 @@ def _attempt(conn, r, provs, dry_run, log):
                     "better than what is held; discarded")
                 worker._discard(staged)
                 continue
+            # track_no included so worker.want_track keeps the listing's number through the
+            # replacement — otherwise the better copy adopts its own source release's position.
             want_d = {"artist": r["artist"], "title": r["title"], "album": r["album"],
-                      "year": r["year"], "artist_lead": r["artist_lead"]}
+                      "year": r["year"], "artist_lead": r["artist_lead"],
+                      "track_no": r["want_track"]}
             track = info.get("tag_track") or r["track_no"]
             dest = worker.destination(want_d, os.path.splitext(staged)[1].lower(), track)
             os.makedirs(os.path.dirname(dest), exist_ok=True)

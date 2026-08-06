@@ -67,6 +67,9 @@ def album_detail(album_id, source="deezer"):
     The album artist and release type exist so a caller can refuse an album before queueing it —
     a "Various Artists" compilation or a tribute act's release passes a title search happily and
     is only visible as wrong here.
+
+    ``track_no`` is the listing sequence, deliberately not the source's per-disc position: album
+    directories are flat, and per-disc numbering would give a two-disc release two "05" files.
     """
     if source == "itunes":
         d = _get(f"https://itunes.apple.com/lookup?id={album_id}&entity=song&limit=200")
@@ -107,7 +110,7 @@ def _get(url):
 
 
 def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer",
-              listing=None, attribution=None, enrich=None):
+              listing=None, attribution=None, enrich=None, enrich_track=None):
     """Add every track of an album as an individual want, in one transaction.
 
     Fetched first, written second. Committing per track let the worker claim rows mid-add, past the
@@ -122,6 +125,12 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
 
     ``enrich`` is an optional want id given the same attribution inside the same transaction, so a
     crash cannot queue an album while leaving the song that seeded it album-less, or vice versa.
+    ``enrich_track`` is that want's position on this release, when the caller located it.
+
+    Tracks whose want already exists are enriched in place (NULL album, year and track number
+    only). Without this, an already-pending want acquired later was numbered from whatever release
+    the provider served \u2014 the completed directory then held the source release's number, not this
+    album's.
     """
     title, year, tracks = listing if listing else album_tracks(album_id, source)
     if attribution:
@@ -139,7 +148,11 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
                 continue
             wid, created = db.add_want(conn, t["artist"], t["title"], title, year,
                                        t["duration"], requested_by, allow_dup=allow_dup,
-                                       batch=batch, batch_label=label, commit=False)
+                                       batch=batch, batch_label=label,
+                                       track_no=t.get("track_no"), commit=False)
+            if not created and db.enrich_want(conn, wid, title, year,
+                                              track_no=t.get("track_no"), commit=False):
+                enriched += 1
             row = conn.execute("SELECT status FROM wants WHERE id=?", (wid,)).fetchone()
             if row and row["status"] == db.STATUS_HAVE:
                 already += 1
@@ -147,8 +160,9 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
                 added += 1
             else:
                 existing += 1
-        if enrich and db.enrich_want(conn, enrich, title, year, commit=False):
-            enriched = 1
+        if enrich and db.enrich_want(conn, enrich, title, year, track_no=enrich_track,
+                                     commit=False):
+            enriched += 1
         db.log_event(conn, "add-album", title,
                      f"{added} queued, {already} already held", commit=False)
         conn.commit()
@@ -323,13 +337,17 @@ def complete_album(conn, want_id, requested_by=None):
     source, ref, detail, attribution = chosen
     tracks = list(detail["tracks"])
     pos = _seed_position(tracks, seed)
+    seed_track = None
     if pos is not None:
-        tracks.pop(pos)
+        # Popped, never renumbered: the remaining tracks keep their positions on the release, and
+        # the seed's own position rides along so its file can be renumbered by refile if the
+        # download that satisfied it came from a differently-ordered release.
+        seed_track = tracks.pop(pos).get("track_no")
     if not tracks:
         return {"outcome": "single", "resolved": detail["title"], "source": source}
     r = add_album(conn, ref, requested_by, source=source,
                   listing=(detail["title"], detail["year"], tracks),
-                  attribution=attribution, enrich=want_id)
+                  attribution=attribution, enrich=want_id, enrich_track=seed_track)
     r.update({"outcome": "completed" if r["added"] else "already",
               "resolved": detail["title"],
               "edition_differs": bool(album) and not attribution,
