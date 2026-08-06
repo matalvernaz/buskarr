@@ -129,8 +129,13 @@ def destination(want, ext, track=None):
     year = str(want["year"] or "").strip()[:4]
     if real_album and year.isdigit() and 1000 <= int(year) <= 2999:
         album = f"{album} ({year})"
-    dest = os.path.join(LIBRARY, safe(folder_artist(want)), album,
-                        f"{int(track or 1):02d} - {safe(want['title'])}{ext}")
+    # "Singles" is not a release, so it carries no position either — for the same reason it
+    # carries no year. Every song in it is track 1 of its own single, which numbered 47 files in
+    # this library "01" and made the bucket look like one broken album. A track number is written
+    # only where it means "position on THIS album".
+    stem = safe(want["title"])
+    name = f"{int(track):02d} - {stem}{ext}" if (real_album and track) else f"{stem}{ext}"
+    dest = os.path.join(LIBRARY, safe(folder_artist(want)), album, name)
     if not within_library(dest):
         # safe() should make this unreachable; assert it anyway, because the cost of being wrong is
         # writing audio outside the library.

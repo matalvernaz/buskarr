@@ -322,8 +322,17 @@ check("no want number falls back to the source tag",
       worker.destination(w_less, ".flac", 5).endswith("/05 - Song.flac"))
 check("NULL want number falls back too",
       worker.destination(dict(w, track_no=None), ".flac", 7).endswith("/07 - Song.flac"))
-check("neither number falls back to 01",
-      worker.destination(w_less, ".flac", None).endswith("/01 - Song.flac"))
+check("an album track with no position anywhere gets no number, not a fake 01",
+      worker.destination(w_less, ".flac", None).endswith("/Alb (2003)/Song.flac"),
+      worker.destination(w_less, ".flac", None))
+# "Singles" is not a release: every song in it is track 1 of its own single, so a number there is
+# meaningless and 47 files in the real library were all "01".
+sing = {"artist": "A", "title": "Song", "album": None, "year": "2003"}
+check("Singles carries no track number even when one is known",
+      worker.destination(sing, ".flac", 5).endswith("/Singles/Song.flac"),
+      worker.destination(sing, ".flac", 5))
+check("Singles still carries no year",
+      "/Singles/" in worker.destination(sing, ".flac", None))
 check("want_track and destination agree (tag uses the same helper)",
       worker.want_track(w, 5) == 4 and worker.want_track(w_less, 5) == 5)
 

@@ -63,7 +63,10 @@ with tempfile.TemporaryDirectory() as d:
         fh.write("AUDIO BYTES")
 
     conn = db.init(os.path.join(d, "t.db"))
-    wid, _ = db.add_want(conn, "Arrogant Worms", "Song (live)", duration=100.0)
+    # Attributed to an album, because a track number only means something on one. "Singles"
+    # deliberately carries no position — every song in it is track 1 of its own single.
+    wid, _ = db.add_want(conn, "Arrogant Worms", "Song (live)", "Live Bait", "2003",
+                         duration=100.0)
 
     # The download stub reports honest tags; the environment points every module at the tmp tree.
     old = (harvest.DOWNLOAD_DIRS, worker.LIBRARY, scan.probe, worker.tag)
@@ -78,7 +81,7 @@ with tempfile.TemporaryDirectory() as d:
     try:
         r = harvest.harvest(conn, dry_run=False, log=lambda m: None)
         check("the want was matched and imported", r["imported"] == 1, str(r))
-        dest = os.path.join(lib, "Arrogant Worms", "Singles", "03 - Song (live).flac")
+        dest = os.path.join(lib, "Arrogant Worms", "Live Bait (2003)", "03 - Song (live).flac")
         check("placed at the tag's own track number", os.path.exists(dest), dest)
         check("tag written with the source track, not 1",
               tagged and tagged[0][1] == 3, str(tagged))
