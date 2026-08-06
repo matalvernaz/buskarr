@@ -71,21 +71,71 @@ check("a genuinely wrong folder is NOT settled",
 check("a different song is NOT settled",
       not refile._settled("/music/A/Singles/01 - Other.flac", canonical))
 
-print("\n=== 4. album_year upgrades past a dateless first edition ===")
-album_year = {}
+with tempfile.TemporaryDirectory() as d:
+    # Lyrics are written next to the audio by an external tool and are in no database, so a move
+    # that leaves them behind orphans them where the audio used to be.
+    src_dir, dst_dir = os.path.join(d, "old"), os.path.join(d, "new")
+    os.makedirs(src_dir); os.makedirs(dst_dir)
+    old_audio, new_audio = os.path.join(src_dir, "01 - S.flac"), os.path.join(dst_dir, "04 - S.flac")
+    for p in (old_audio, os.path.join(src_dir, "01 - S.lrc"), os.path.join(src_dir, "01 - S.txt")):
+        open(p, "w").write("x")
+    open(new_audio, "w").write("x")           # audio already moved; sidecars follow it
+    n = refile._move_sidecars(old_audio, new_audio, print)
+    check("both sidecars followed the audio", n == 2
+          and os.path.exists(os.path.join(dst_dir, "04 - S.lrc"))
+          and os.path.exists(os.path.join(dst_dir, "04 - S.txt")), str(os.listdir(dst_dir)))
+    check("no sidecar left behind", os.listdir(src_dir) == ["01 - S.flac"],
+          str(os.listdir(src_dir)))
+    check("a second call is a no-op", refile._move_sidecars(old_audio, new_audio, print) == 0)
+
+print("\n=== 4. add_artist album keying: years per release, spelling survives a re-add ===")
+from buskarr import catalog  # noqa: E402
 
 
-def resolve(album, year):
-    k = db.norm(album)
-    if year and not album_year.get(k):
-        album_year[k] = year
-    return album_year.get(k) or year
+class FakeArtistSource:
+    """Catalogue stub for add_artist: canned (wanted, tracks, meta) triple."""
+
+    name = "fake-mb"
+
+    def __init__(self, tracks):
+        self.tracks = tracks
+
+    def artist_catalogue(self, ref):
+        return "Test Act", self.tracks, {"complete": True}
 
 
-check("dateless edition first -> None", resolve("Who I Am", None) is None)
-check("real year arrives -> 1994", resolve("Who I Am", "1994") == "1994")
-check("later dateless track inherits 1994", resolve("Who I Am", None) == "1994")
-check("a later reissue does not override", resolve("Who I Am", "2003") == "1994")
+def trk(title, release, year, dur=100.0):
+    return {"title": title, "artist": "Test Act", "album": release, "year": year,
+            "duration": dur, "release": release, "release_title": release,
+            "release_type": "album", "release_secondary": []}
+
+
+with tempfile.TemporaryDirectory() as d:
+    conn = db.init(os.path.join(d, "t.db"))
+    real_sources = dict(catalog.SOURCES)
+    catalog.SOURCES["fake-mb"] = FakeArtistSource([
+        trk("Song E", "Debut", None), trk("Song F", "Debut", "1990"),
+        trk("Song G", "Debut", None), trk("Song H", "Debut", "2003"),
+        trk("Song I", "Debut (Deluxe Edition)", "2005"),
+    ])
+    try:
+        bulk.add_artist(conn, "x", source="fake-mb")
+        got = {r["title"]: (r["album"], r["year"]) for r in
+               conn.execute("SELECT title, album, year FROM wants")}
+        check("first real year wins for the release",
+              got["Song F"] == ("Debut", "1990") and got["Song G"] == ("Debut", "1990")
+              and got["Song H"] == ("Debut", "1990"), str(got))
+        check("an edition does NOT share the base album's year slot",
+              got["Song I"] == ("Debut (Deluxe Edition)", "2005"), str(got["Song I"]))
+        # Re-add after the source respelled and re-dated the release: the new track must join
+        # the existing spelling and year, not open "DEBUT (1996)" beside "Debut (1990)".
+        catalog.SOURCES["fake-mb"] = FakeArtistSource([trk("Song J", "DEBUT", "1996")])
+        bulk.add_artist(conn, "x", source="fake-mb")
+        j = conn.execute("SELECT album, year FROM wants WHERE title='Song J'").fetchone()
+        check("re-add adopts the existing spelling and year",
+              (j["album"], j["year"]) == ("Debut", "1990"), str(dict(j)))
+    finally:
+        catalog.SOURCES.clear(); catalog.SOURCES.update(real_sources)
 
 print("\n=== 5. track number: the want's listing position beats the source file's tag ===")
 w = {"artist": "A", "title": "Song", "album": "Alb", "year": "2003", "track_no": 4}

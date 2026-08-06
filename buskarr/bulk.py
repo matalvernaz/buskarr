@@ -141,10 +141,21 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
     batch = uuid.uuid4().hex[:10]
     label = f"album \u201c{title}\u201d ({source})"
     added = already = existing = enriched = 0
+    twins = {} if allow_dup else _twin_index(conn, title)
     conn.execute("BEGIN IMMEDIATE")
     try:
         for t in tracks:
             if not t["title"] or not t["artist"]:
+                continue
+            twin = _twin_want(twins, t)
+            if twin:
+                if db.enrich_want(conn, twin["id"], title, year,
+                                  track_no=t.get("track_no"), commit=False):
+                    enriched += 1
+                if twin["status"] == db.STATUS_HAVE:
+                    already += 1
+                else:
+                    existing += 1
                 continue
             wid, created = db.add_want(conn, t["artist"], t["title"], title, year,
                                        t["duration"], requested_by, allow_dup=allow_dup,
@@ -172,6 +183,65 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
     return {"album": title, "year": year, "added": added, "already": already,
             "existing": existing, "total": len(tracks), "batch": batch, "source": source,
             "enriched": enriched}
+
+
+# A listing track and an existing want are the same recording when their durations agree this
+# tightly (dedupe's rule) and their titles are equivalent under the folds below. Deliberately
+# tighter than match.acceptable_delta: claiming a want is destructive-adjacent, so the gate is
+# the strict one.
+TWIN_DURATION = 4.0
+
+
+def _word_fold(s):
+    """strict_norm with parentheses dissolved into spaces: 'Song (Chiptune)' == 'Song - Chiptune'.
+
+    Complements db.norm for twin detection. norm STRIPS a parenthetical, equating
+    "(2023 Version)" with "(2023 re-recorded version)" only by dropping both — which also drops
+    "Chiptune", so the dash-suffix spelling of the same word never matched. Folding the
+    parentheses keeps the words and dissolves only the punctuation.
+    """
+    return " ".join(db.strict_norm(s).replace("(", " ").replace(")", " ").split())
+
+
+def _twin_index(conn, album):
+    """Existing wants of this release, keyed by both title folds, for ``add_album``'s twin gate."""
+    twins = {}
+    target = db.strict_norm(album or "")
+    if not target:
+        return twins
+    for w in conn.execute(
+            "SELECT w.id, w.title, w.artist, w.album, w.status, w.duration, "
+            "f.duration AS fdur FROM wants w LEFT JOIN files f ON f.path = w.file_path "
+            "WHERE w.album IS NOT NULL"):
+        if db.strict_norm(w["album"]) != target:
+            continue
+        for k in {db.norm(w["title"]), _word_fold(w["title"])}:
+            twins.setdefault(k, []).append(w)
+    return twins
+
+
+def _twin_want(twins, t):
+    """The existing want that IS this listing track under another spelling, or None.
+
+    Same release (the index is album-scoped), duration within TWIN_DURATION, compatible credits,
+    and a title equal under either fold. Exists because one respelled catalogue listing
+    re-downloaded seventeen held recordings: the seed is vetted fuzzily by ``_seed_position``,
+    but every other listing track was deduplicated on the strict title alone, so "(Chiptune)"
+    against "- Chiptune" and "(2023 Version)" against "(2023 re-recorded version)" both queued
+    fresh downloads of audio already on disk.
+    """
+    dur = t.get("duration")
+    if not dur or not twins:
+        return None
+    for k in {db.norm(t["title"]), _word_fold(t["title"])}:
+        for w in twins.get(k, []):
+            held = w["duration"] or w["fdur"]
+            if not held or abs(held - dur) > TWIN_DURATION:
+                continue
+            if credit.credited_to(t["artist"], credit.lead_artist(w["artist"])) \
+                    or credit.credited_to(w["artist"], credit.lead_artist(t["artist"])):
+                return w
+    return None
 
 
 # How many candidate releases to fetch and inspect per catalogue before concluding a song's album
@@ -392,11 +462,21 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
     summary["releases"] = len(by_release)
 
     seen_titles, held_titles = set(), set()
-    # One album, one directory. The same album exists as several MusicBrainz releases and some carry
-    # no date at all, so tracks claimed from different editions produced "Who I Am (1994)" beside
-    # "Who I Am". The first year seen for an album title wins for every track on it — releases are
-    # already walked earliest-first, so that is the original.
-    album_year = {}
+    # One album, one spelling, one year, one directory. Keyed on strict_norm, never db.norm:
+    # norm strips parentheticals, so "Bones in the Ocean (10 Year Anniversary Edition)" shared a
+    # year slot with "Bones in the Ocean" and the edition was stamped with the base album's year.
+    # Values are [spelling, year]. The first spelling seen wins; the first REAL year wins (not
+    # first-sight setdefault — a dateless first edition would pin None forever, and later tracks
+    # keeping their own years is exactly the "Who I Am (1994)" beside "Who I Am" split). Seeded
+    # from wants that already exist for this artist, so a re-add whose source has since respelled
+    # or re-dated a release joins the existing directory instead of opening a variant beside it —
+    # one MusicBrainz respelling between two adds duplicated a whole release.
+    album_known = {}
+    if wanted:
+        for r in conn.execute(
+                "SELECT DISTINCT album, year FROM wants WHERE artist_lead=? AND album IS NOT NULL "
+                "ORDER BY year IS NULL, album", (db.folder_key(wanted),)):
+            album_known.setdefault(db.strict_norm(r["album"]), [r["album"], r["year"]])
     capped = False
     # Albums are walked before singles, so ``seen_titles`` gives a song to its album and a single
     # only gets what no album carried. Without this the traversal order was the catalogue's, which
@@ -452,14 +532,13 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
                 album = t.get("album") or rel_name or None
                 year = t.get("year")
                 if album:
-                    # Not setdefault: a first edition with no date would store None permanently and
-                    # never upgrade, so later tracks kept their own years and the album split across
-                    # directories anyway — the exact failure this map exists to prevent. The first
-                    # REAL year wins, and every track on the album then reads it back.
-                    key_album = db.norm(album)
-                    if year and not album_year.get(key_album):
-                        album_year[key_album] = year
-                    year = album_year.get(key_album) or year
+                    entry = album_known.setdefault(db.strict_norm(album), [album, None])
+                    # Album and year travel together — they describe one release — so adopting
+                    # the known spelling adopts its year with it.
+                    album = entry[0]
+                    if year and not entry[1]:
+                        entry[1] = year
+                    year = entry[1] or year
                 held = db.find_file(conn, t["artist"] or "", t["title"])
                 if held:
                     held_titles.add(key)

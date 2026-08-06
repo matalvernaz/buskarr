@@ -233,6 +233,43 @@ with tempfile.TemporaryDirectory() as d:
         catalog.SOURCES.update(REAL_SOURCES)
         bulk.album_detail = REAL_DETAIL
 
+print("\n=== Twin gate: a respelled listing track claims the held want, not a new download ===")
+with tempfile.TemporaryDirectory() as d:
+    conn, wid = fresh_conn(d, seed_album="Commodore Test", seed_year="2021")
+    # Held sibling under the dash spelling, credited to the duo — the listing spells it with
+    # parentheses and credits the lead alone, which is exactly the pair that re-downloaded a
+    # whole held album.
+    sid, _ = db.add_want(conn, "Test Act & Guest", "Second Song - Chiptune", "Commodore Test",
+                         "2021", 150.0)
+    conn.execute("UPDATE wants SET status=?, provider='tidal', file_path='/music/y.flac' "
+                 "WHERE id=?", (db.STATUS_HAVE, sid))
+    conn.commit()
+    deezer = FakeSource("deezer", albums=[
+        {"source": "deezer", "ref": "90", "title": "Commodore Test", "artist": "Test Act",
+         "kind": "album", "tracks": 3}])
+    install({"deezer": deezer, "itunes": FakeSource("itunes")}, {
+        ("deezer", "90"): {"title": "Commodore Test", "year": "2021", "artist": "Test Act",
+                           "kind": "album",
+                           "tracks": [tr("Hook Song", 200.0),
+                                      tr("Second Song (Chiptune)", 151.0, no=2),
+                                      tr("Different Length (Chiptune)", 60.0, no=3)]}})
+    try:
+        r = bulk.complete_album(conn, wid)
+        check("respelled track claimed the held want — no new want row",
+              db.find_want(conn, "Test Act", "Second Song (Chiptune)") is None
+              and conn.execute("SELECT COUNT(*) FROM wants").fetchone()[0] == 3,
+              str(r))
+        check("held want enriched with the listing position",
+              conn.execute("SELECT track_no FROM wants WHERE id=?", (sid,)).fetchone()[0] == 2)
+        check("twin counted as already held", r["already"] == 1, str(r))
+        check("a duration-disagreeing title still queues",
+              r["added"] == 1
+              and db.find_want(conn, "Test Act", "Different Length (Chiptune)") is not None,
+              str(r))
+    finally:
+        catalog.SOURCES.update(REAL_SOURCES)
+        bulk.album_detail = REAL_DETAIL
+
 print("\n=== Outcomes: single, already complete, outage vs genuine absence ===")
 with tempfile.TemporaryDirectory() as d:
     conn, wid = fresh_conn(d)

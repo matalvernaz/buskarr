@@ -21,6 +21,28 @@ from . import db, scan, worker
 
 LIBRARY = os.environ.get("LIBRARY_DIR", "/music")
 
+# Companion files that belong to one audio file and are named from it. Lyrics are written next to
+# the audio by an external tool, so they are not in the files table and nothing else knows they
+# exist — a move that leaves them behind orphans them in a directory the audio has left.
+SIDECAR_EXT = (".lrc", ".txt")
+
+
+def _move_sidecars(old, new, log):
+    """Move ``old``'s same-stem companions alongside ``new``. Returns how many moved."""
+    old_stem, new_stem = os.path.splitext(old)[0], os.path.splitext(new)[0]
+    moved = 0
+    for ext in SIDECAR_EXT:
+        src = old_stem + ext
+        if not os.path.exists(src):
+            continue
+        try:
+            worker.place(src, new_stem + ext)
+            moved += 1
+        except OSError as e:
+            # Never fail a refile over a lyrics file; the audio move is what matters.
+            log(f"      sidecar {os.path.basename(src)} not moved ({type(e).__name__})")
+    return moved
+
 
 def _settled(path, canonical):
     """True when ``path`` is already the canonical name or an accepted suffixed form of it.
@@ -85,7 +107,7 @@ def refile(conn, artist=None, dry_run=True, log=print):
         log("every placed file is already where the current rules put it")
         return {"moved": 0, "collisions": 0}
     log(f"{len(moves)} file(s) to move:")
-    moved = collisions = 0
+    moved = collisions = sidecars = 0
     for w, old, new in moves:
         log(f"  {'would move' if dry_run else 'moving'} {os.path.relpath(old, LIBRARY)}")
         log(f"      -> {os.path.relpath(new, LIBRARY)}"
@@ -102,6 +124,7 @@ def refile(conn, artist=None, dry_run=True, log=print):
         # The album tag has to follow the move, or the next scan reads the old one back off the file
         # and the library disagrees with its own directory layout.
         worker.tag(final, w, (scan.probe(final) or {}).get("tag_track"))
+        sidecars += _move_sidecars(old, final, log)
         conn.execute("UPDATE wants SET file_path=? WHERE id=?", (final, w["id"]))
         conn.execute("DELETE FROM files WHERE path=?", (old,))
         conn.commit()
@@ -109,7 +132,8 @@ def refile(conn, artist=None, dry_run=True, log=print):
     if not dry_run:
         db.log_event(conn, "refile", artist, f"{moved} file(s) moved to current placement rules")
     log(f"\n{moved} file(s) {'would be moved' if dry_run else 'moved'}, "
-        f"{collisions} name collision(s)")
+        f"{collisions} name collision(s)"
+        + (f", {sidecars} sidecar(s) moved" if sidecars else ""))
     if dry_run:
         log("dry run — nothing moved. Re-run with --apply, then rescan.")
     else:
