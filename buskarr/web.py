@@ -219,6 +219,10 @@ def _mode_radios(mode):
 
 SEARCH_WORKERS = 6
 DISAMBIGUATION_TRACKS = 3
+# Song rows rendered from one search. The cap is for the screen reader, not the server — /wants
+# rendered in 18 ms and was still unusable at 789 controls. Reaching it is REPORTED: this printed
+# "54 result(s)" above 30 rows and gave no sign the other 24 existed.
+TRACK_RESULTS_SHOWN = 30
 
 
 def _fanout(fn, items):
@@ -258,8 +262,9 @@ def _track_results(conn, q):
         return (_source_note(per) + "<p>No results from any catalogue. If the song is not listed "
                 "anywhere, use <a href='#manual'>Add a song by name</a> below — that asks the "
                 "download providers directly.</p>")
+    shown = merged[:TRACK_RESULTS_SHOWN]
     rows = []
-    for t in merged[:30]:
+    for t in shown:
         dur = int(t["duration"] or 0)
         tol = match.acceptable_delta(t["duration"])
         held = db.find_file(conn, t["artist"], t["title"], t["duration"],
@@ -285,10 +290,14 @@ def _track_results(conn, q):
                     f"<td>{dur // 60}:{dur % 60:02d}</td>"
                     f"<td>{esc(', '.join(t['sources']))}</td>"
                     f"<td>{status}</td><td>{action}</td></tr>")
-    return (_source_note(per) + f"<h3>Songs</h3><p>{len(merged)} result(s)</p><table>"
-            "<caption class='muted'>Searched Deezer, MusicBrainz and Apple together. Songs listed "
-            "by more than one catalogue are shown first, since agreement is a better signal than "
-            "any single catalogue's ranking.</caption>"
+    # The caption carries the count, because that is what a screen reader announces on entering the
+    # table, and it is the only place the cap can be stated where reaching it cannot go unnoticed.
+    count = (f"{len(merged)} song(s)." if len(shown) == len(merged) else
+             f"The first {len(shown)} of {len(merged)} song(s), best matches first.")
+    return (_source_note(per) + "<h3>Songs</h3><table>"
+            f"<caption class='muted'>{count} Searched Deezer, MusicBrainz and Apple together. "
+            "Songs listed by more than one catalogue are shown first, since agreement is a better "
+            "signal than any single catalogue's ranking.</caption>"
             "<thead><tr><th scope='col'>Artist</th><th scope='col'>Title</th>"
             "<th scope='col'>Album</th><th scope='col'>Length</th><th scope='col'>Listed by</th>"
             "<th scope='col'>In library?</th><th scope='col'>Action</th></tr></thead>"

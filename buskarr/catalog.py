@@ -30,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import db
+from . import db, match
 
 UA = "buskarr/1.0 (homelab music manager)"
 TIMEOUT = 25
@@ -514,9 +514,15 @@ def _track_key(t):
     Duration is bucketed rather than compared exactly because catalogues disagree by a second or two
     on the same recording, but parentheticals are preserved — ``(live)`` and ``(reprise)`` are
     different recordings and must not collapse.
+
+    The artist is folded script-preservingly, not with ``db.norm``. norm strips to ``[a-z0-9]``, so
+    every non-Latin credit came back empty and two unrelated artists sharing a title and a duration
+    bucket merged into one row — which then reported both catalogues as having listed it. ``_squash``
+    catches the residue that folds to nothing at all, the band "!!!" being the standing example.
     """
+    artist = match._fold(t["artist"]) or match._squash(t["artist"])
     dur = int((t["duration"] or 0) // 5)
-    return db.norm(t["artist"]), db.strict_norm(t["title"]), dur
+    return artist, db.strict_norm(t["title"]), dur
 
 
 def merge_tracks(results):
