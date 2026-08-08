@@ -150,6 +150,7 @@ def harvest(conn, dry_run=True, limit=0, log=log):
                 imported -= 1
                 continue
             worker.tag(dest, w, info.get("tag_track"))
+            scan.index_file(conn, worker.LIBRARY, dest)
             conn.execute(
                 "UPDATE wants SET status=?, provider=?, file_path=?, strikes=0,"
                 " retry_after=NULL, note=? WHERE id=?",

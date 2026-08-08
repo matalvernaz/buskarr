@@ -350,6 +350,7 @@ def attempt(conn, want, provs):
                         and match.duration_ok(want["duration"], held):
                     log(f"    destination already holds this recording; recording it: {dest}")
                     _discard(staged)
+                    _scan.index_file(conn, LIBRARY, dest)
                     conn.execute(
                         "UPDATE wants SET status=?, provider=?, file_path=?, strikes=0, "
                         "retry_after=NULL, note=? WHERE id=?",
@@ -389,6 +390,11 @@ def attempt(conn, want, provs):
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             final = place(staged, dest)
             tag(final, want, track_no)
+            # After tag(), so the recorded mtime is the one a later scan will see. `files` is
+            # otherwise written only by a full scan, and nothing schedules one — a track acquired
+            # here was absent from the Library page until somebody pressed Rescan.
+            from . import scan as _scan
+            _scan.index_file(conn, LIBRARY, final)
             conn.execute(
                 "UPDATE wants SET status=?, provider=?, file_path=?, strikes=0, retry_after=NULL,"
                 " note=? WHERE id=?",

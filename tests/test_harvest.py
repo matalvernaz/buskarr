@@ -75,7 +75,8 @@ with tempfile.TemporaryDirectory() as d:
     worker.LIBRARY = lib
     scan.probe = lambda path: {
         "tag_title": "Song (live)", "tag_artist": "Arrogant Worms", "tag_album": None,
-        "tag_year": None, "tag_track": 3, "duration": 100.0, "codec": "flac",
+        "tag_album_artist": "Arrogant Worms", "tag_year": None, "tag_track": 3,
+        "duration": 100.0, "codec": "flac",
         "bitrate": 900000, "sample_rate": 44100, "bit_depth": 16}
     worker.tag = lambda path, want, track=None: tagged.append((path, track)) or True
     try:
@@ -89,6 +90,8 @@ with tempfile.TemporaryDirectory() as d:
         check("want satisfied by harvest",
               row["status"] == db.STATUS_HAVE and row["provider"] == "harvest",
               f"{row['status']}/{row['provider']}")
+        check("imported file is in the library index straight away",
+              conn.execute("SELECT 1 FROM files WHERE path=?", (dest,)).fetchone() is not None)
         r2 = harvest.harvest(conn, dry_run=False, log=lambda m: None)
         check("second run imports nothing (idempotent)", r2["imported"] == 0, str(r2))
     finally:

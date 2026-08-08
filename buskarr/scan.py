@@ -104,6 +104,67 @@ def from_path(root, path):
     return artist, album, stem.strip(), track_no, year
 
 
+def file_row(root, path, stat, info):
+    """Build the ``files`` row for one library file. ``info`` is ``probe()``'s result, or None.
+
+    Shared by the walk and by ``index_file`` so a track recorded the moment it is placed is
+    identical to the same track recorded by a full scan. Two constructions of this row would
+    diverge, and the divergence would be invisible until something queried the difference.
+    """
+    p_artist, p_album, p_title, p_track, p_year = from_path(root, path)
+    if not info:
+        return {
+            "path": path, "artist": p_artist, "artist_lead": p_artist,
+            "album": p_album, "title": p_title,
+            "file_title": p_title, "tag_title": None,
+            "track_no": p_track, "year": p_year, "codec": "UNREADABLE", "bitrate": 0,
+            "sample_rate": None, "bit_depth": None, "duration": None,
+            "size": stat.st_size, "provider": None, "mtime": stat.st_mtime,
+        }
+    return {
+        "path": path,
+        # Tags win when present; the path convention is the fallback, not the reverse,
+        # because tags survive renames and path parsing does not.
+        "artist": info["tag_artist"] or p_artist,
+        # The directory, always — it is the lead credit by construction, while the tag holds
+        # the full collaboration credit. Grouping the library on the tag is what showed one
+        # band as eight artists.
+        "artist_lead": p_artist,
+        # Recorded raw, never defaulted to the directory: an empty tag is the defect
+        # repair looks for, and filling it in here would hide it.
+        "album_artist": info["tag_album_artist"],
+        "album": info["tag_album"] or p_album,
+        # Resolved title still prefers the tag, but both are recorded so callers can
+        # choose: dedup needs the filename, repair needs the disagreement.
+        "title": info["tag_title"] or p_title,
+        "file_title": p_title,
+        "tag_title": info["tag_title"],
+        "track_no": info["tag_track"] or p_track,
+        "year": info["tag_year"] or p_year,
+        "codec": info["codec"], "bitrate": info["bitrate"],
+        "sample_rate": info["sample_rate"], "bit_depth": info["bit_depth"],
+        "duration": info["duration"], "size": stat.st_size,
+        "provider": None, "mtime": stat.st_mtime,
+    }
+
+
+def index_file(conn, root, path):
+    """Record one file in ``files`` without walking the library. Returns False if it is gone.
+
+    The worker calls this the moment it places a download. Without it ``files`` is written only by
+    a full scan, so a freshly acquired track — and its whole artist, if it is the first one — is
+    absent from the Library page and from every query built on that table until somebody presses
+    Rescan by hand.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return False
+    db.upsert_file(conn, file_row(root, path, stat, probe(path)))
+    conn.commit()
+    return True
+
+
 def scan(conn, root, progress_every=250, log=print):
     """Walk the library and refresh the files table. Returns counts."""
     seen, added, unreadable = 0, 0, 0
@@ -133,49 +194,13 @@ def scan(conn, root, progress_every=250, log=print):
             if known.get(full) == stat.st_mtime:
                 continue
             info = probe(full)
-            p_artist, p_album, p_title, p_track, p_year = from_path(root, full)
             if not info:
                 unreadable += 1
-                db.upsert_file(conn, {
-                    "path": full, "artist": p_artist, "artist_lead": p_artist,
-                    "album": p_album, "title": p_title,
-                    "file_title": p_title, "tag_title": None,
-                    "track_no": p_track, "year": p_year, "codec": "UNREADABLE", "bitrate": 0,
-                    "sample_rate": None, "bit_depth": None, "duration": None,
-                    "size": stat.st_size, "provider": None, "mtime": stat.st_mtime,
-                })
-                # Committed per file, here and below: the next iteration's ffprobe takes seconds
-                # over NFS, and sqlite3's implicit transaction would otherwise hold the ONLY write
-                # lock across the entire remaining walk — the worker and the web process both time
-                # out at 30 s long before a post-import scan finishes.
-                conn.commit()
-                added += 1
-                continue
-            db.upsert_file(conn, {
-                "path": full,
-                # Tags win when present; the path convention is the fallback, not the reverse,
-                # because tags survive renames and path parsing does not.
-                "artist": info["tag_artist"] or p_artist,
-                # The directory, always — it is the lead credit by construction, while the tag holds
-                # the full collaboration credit. Grouping the library on the tag is what showed one
-                # band as eight artists.
-                "artist_lead": p_artist,
-                # Recorded raw, never defaulted to the directory: an empty tag is the defect
-                # repair looks for, and filling it in here would hide it.
-                "album_artist": info["tag_album_artist"],
-                "album": info["tag_album"] or p_album,
-                # Resolved title still prefers the tag, but both are recorded so callers can
-                # choose: dedup needs the filename, repair needs the disagreement.
-                "title": info["tag_title"] or p_title,
-                "file_title": p_title,
-                "tag_title": info["tag_title"],
-                "track_no": info["tag_track"] or p_track,
-                "year": info["tag_year"] or p_year,
-                "codec": info["codec"], "bitrate": info["bitrate"],
-                "sample_rate": info["sample_rate"], "bit_depth": info["bit_depth"],
-                "duration": info["duration"], "size": stat.st_size,
-                "provider": None, "mtime": stat.st_mtime,
-            })
+            db.upsert_file(conn, file_row(root, full, stat, info))
+            # Committed per file: the next iteration's ffprobe takes seconds over NFS, and
+            # sqlite3's implicit transaction would otherwise hold the ONLY write lock across the
+            # entire remaining walk — the worker and the web process both time out at 30 s long
+            # before a post-import scan finishes.
             conn.commit()
             added += 1
             if added % progress_every == 0:
