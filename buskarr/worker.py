@@ -541,6 +541,8 @@ def cycle(conn):
     for e in entries:
         if not e["available"]:
             log(f"provider {e['name']} UNAVAILABLE: {e['detail']}")
+        elif not e["healthy"]:
+            log(f"provider {e['name']} DEGRADED: {e['detail']}")
     if not provs:
         log("no providers available — nothing to do")
         return 0

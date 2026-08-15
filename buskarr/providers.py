@@ -13,6 +13,8 @@ Order matters and is not arbitrary:
 Nothing here writes to the library. Providers fetch into a staging path; placement is the
 caller's job, so file placement stays in one auditable place.
 """
+import contextlib
+import fcntl
 import json
 import os
 import shutil
@@ -25,6 +27,12 @@ import urllib.request
 TIDDL = os.environ.get("TIDDL_BIN", "/opt/tiddl-venv/bin/tiddl")
 TIDDL_AUTH = os.environ.get("TIDDL_AUTH", "")
 TIDAL_AUTH_JSON = os.environ.get("TIDAL_AUTH_JSON", "/state/tidal_auth.json")
+# Rewritten after every verified refresh, so recovery uses a credential minutes old rather than the
+# bootstrap seed, which was twelve days stale the one time it was needed. Kept separate from the
+# seed: a snapshot is only ever as good as the last refresh, and the seed is the floor to fall back
+# to if a snapshot is itself revoked.
+TIDAL_AUTH_BACKUP = os.environ.get("TIDAL_AUTH_BACKUP", "/state/tidal_auth.backup.json")
+TIDAL_REFRESH_LOCK = os.environ.get("TIDAL_REFRESH_LOCK", "/state/tidal-refresh.lock")
 YTDLP = os.environ.get("YTDLP_BIN", "yt-dlp")
 COOKIES = os.environ.get("YT_COOKIES", "/state/cookies.txt")
 DENO = "deno:" + os.environ.get("DENO_PATH", "/usr/local/bin/deno")
@@ -45,6 +53,53 @@ def _log(msg):
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}", flush=True)
 
 
+def _atomic_copy(src, dest, mode=0o600):
+    """Copy through a temp file and rename, so an interrupted copy never publishes a partial one.
+
+    The whole reason the Tidal credential is fragile is that its writer truncates in place; a
+    recovery mechanism that copied the same way would inherit the same failure.
+    """
+    tmp = f"{dest}.tmp{os.getpid()}"
+    try:
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dest)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+@contextlib.contextmanager
+def _flock(path):
+    """Hold an exclusive lock across a block, or proceed unlocked if one cannot be taken.
+
+    The worker's cycle and a maintenance sweep are separate processes sharing one ``$HOME``, and
+    both refresh the Tidal token. tiddl's writer truncates before it serialises, so two overlapping
+    refreshes have a window where the file is empty. Refusing to refresh at all would be worse than
+    refreshing unlocked, so a lock failure is not fatal.
+    """
+    fh = None
+    try:
+        fh = open(path, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except OSError:
+        if fh:
+            fh.close()
+        fh = None
+    try:
+        yield
+    finally:
+        if fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            finally:
+                fh.close()
+
+
 # --------------------------------------------------------------------------- Tidal
 
 class Tidal:
@@ -55,46 +110,93 @@ class Tidal:
         return self.status()[0]
 
     def status(self):
-        """``(usable, why)`` — the credential must PARSE, not merely exist.
+        """``(usable, healthy, why)`` — the credential must PARSE, not merely exist.
 
         Testing existence alone let a zero-byte ``auth.json`` report the provider available while
         every search returned nothing, so acquisition fell through to a lossy provider for as long
         as it took someone to notice a codec. The file is the thing that rots here, so the check
         has to read it.
+
+        Damaged-but-recoverable is deliberately still USABLE: ``refresh`` heals at the top of every
+        cycle, before anything fetches, so refusing to use Tidal would cause the very outage this
+        is meant to prevent. It is not HEALTHY, because a credential that had to be rebuilt from a
+        copy is worth saying out loud.
         """
         if not TIDDL_AUTH:
-            return False, "TIDDL_AUTH is not set"
-        try:
-            self._read_auth()
-        except OSError as e:
-            return False, (f"no readable auth file at {self._auth_path()} ({type(e).__name__}) — "
-                           "re-authenticate with: tiddl auth login")
-        except (json.JSONDecodeError, KeyError):
-            return False, (f"auth file at {self._auth_path()} is not a usable session — "
-                           "re-authenticate with: tiddl auth login")
-        return True, "authenticated"
+            return False, False, "TIDDL_AUTH is not set"
+        if self._usable(self._live_path()):
+            return True, True, "authenticated"
+        spare = next((p for p in (TIDAL_AUTH_BACKUP, TIDAL_AUTH_JSON) if self._usable(p)), None)
+        if spare:
+            return True, False, (f"the live session at {self._live_path()} is damaged; it is "
+                                 f"rebuilt from {spare} at the start of every cycle, so downloads "
+                                 "continue. Recurring means something is killing tiddl mid-write")
+        return False, False, (f"no usable session at {self._live_path()} and no recoverable copy "
+                              "— re-authenticate with: tiddl auth login")
 
     @staticmethod
-    def _auth_path():
-        """Path to the session tiddl actually maintains.
+    def _live_path():
+        """The one file tiddl itself reads and writes. Everything else here exists to protect it."""
+        return os.path.join(os.path.expanduser("~"), ".tiddl", "auth.json")
 
-        ``TIDAL_AUTH_JSON`` is a first-run bootstrap only — the entrypoint copies it into place once
-        and nothing ever writes it again. tiddl rewrites ``$HOME/.tiddl/auth.json`` on every
-        refresh, so reading the seed means presenting a token that expires ~4h after the container
-        was first built and never recovers: searches 401 forever and every acquisition silently
-        falls back to a lossy provider.
+    @staticmethod
+    def _usable(path):
+        """True if PATH holds a session that could actually authenticate.
 
-        Size, not existence: a truncated live file is worth less than the seed, whose refresh token
-        may well still be good. tiddl rewrites this file in place, so an interrupted write leaves
-        zero bytes and the old ``os.path.exists`` test preferred that over a working credential.
+        Parsing is the test, not existence or size. tiddl's ``save_auth_data`` opens the file with
+        mode ``"w"`` — which truncates BEFORE the JSON is serialised — so an interrupted refresh
+        leaves a file that exists, is owned correctly, and authenticates nothing.
         """
-        live = os.path.join(os.path.expanduser("~"), ".tiddl", "auth.json")
         try:
-            if os.path.getsize(live) > 0:
-                return live
-        except OSError:
-            pass
-        return TIDAL_AUTH_JSON
+            with open(path) as fh:
+                return bool(json.load(fh).get("token"))
+        except (OSError, json.JSONDecodeError, AttributeError, ValueError):
+            return False
+
+    @classmethod
+    def _sources(cls):
+        """Credentials in preference order: the live session, the snapshot, the bootstrap seed."""
+        return [p for p in (cls._live_path(), TIDAL_AUTH_BACKUP, TIDAL_AUTH_JSON) if p]
+
+    @classmethod
+    def _auth_path(cls):
+        """First credential that parses, falling back to the live path when none do.
+
+        Returning the live path on total failure keeps error messages pointed at the file a human
+        has to fix, rather than at whichever copy happened to be checked last.
+        """
+        for p in cls._sources():
+            if cls._usable(p):
+                return p
+        return cls._live_path()
+
+    @classmethod
+    def heal(cls):
+        """Put a usable session back where tiddl reads it. Returns the source used, or None.
+
+        Reading around a damaged live file is not enough: ``search`` would recover but ``fetch``
+        shells out to tiddl, which opens its own ``$HOME`` copy and would still fail. The file has
+        to be repaired in place, and this runs at the top of every refresh so a truncation costs one
+        cycle instead of however long it takes a human to notice a codec.
+        """
+        live = cls._live_path()
+        if cls._usable(live):
+            return None
+        for src in (TIDAL_AUTH_BACKUP, TIDAL_AUTH_JSON):
+            if cls._usable(src) and _atomic_copy(src, live):
+                _log(f"tidal: live session at {live} was unusable; restored from {src}")
+                return src
+        return None
+
+    @classmethod
+    def _snapshot(cls):
+        """Keep a known-good copy of the live session, written atomically. True if one was taken.
+
+        Guarded on the live file parsing, so a damaged session can never overwrite the good copy —
+        that would turn a recoverable truncation into a real re-authentication.
+        """
+        live = cls._live_path()
+        return bool(cls._usable(live) and _atomic_copy(live, TIDAL_AUTH_BACKUP))
 
     def _read_auth(self):
         """The parsed session. Raises rather than returning a dict that cannot authenticate."""
@@ -107,19 +209,42 @@ class Tidal:
     def refresh(self):
         """Tidal access tokens last ~4h, so every run refreshes before doing anything.
 
-        Success is the exit code. The previous test asked whether the output contained the word
-        "refresh", which the FAILURE path also satisfies — a dead credential prints a pydantic
-        trace mentioning it twice — so a broken token reported a successful refresh and the cycle
-        carried on believing Tidal was live.
+        Repair, refresh, snapshot — in that order, under a lock:
+
+        * A truncated session cannot be refreshed, so ``heal`` runs first or the refresh fails for
+          a reason that has nothing to do with the token.
+        * Success is the EXIT CODE. The previous test asked whether the output contained the word
+          "refresh", which the failure path also satisfies — a dead credential prints a pydantic
+          trace mentioning it twice — so a broken token reported success and the cycle carried on
+          believing Tidal was live.
+        * A failed run may have truncated the file on its way down, so it heals again rather than
+          leaving the damage for the next cycle to find.
+        * The snapshot is taken only after a verified refresh, which is what keeps the recovery
+          copy current. Recovering from a twelve-day-old seed worked once; it is not a plan.
+
+        The lock covers the whole sequence because an upgrade sweep refreshes too, in its own
+        process, and two truncate-then-write cycles overlapping is a way to lose the credential
+        that no amount of care inside one process prevents.
         """
-        env = dict(os.environ, TIDDL_AUTH=TIDDL_AUTH)
-        r = subprocess.run([TIDDL, "auth", "refresh", "--force"],
-                           capture_output=True, text=True, env=env, timeout=120)
-        if r.returncode != 0:
-            _log(f"tidal: token refresh FAILED (exit {r.returncode}) — Tidal will return nothing "
-                 f"until re-authenticated: {(r.stdout + r.stderr).strip()[-200:]}")
-            return False
-        return True
+        with _flock(TIDAL_REFRESH_LOCK):
+            self.heal()
+            env = dict(os.environ, TIDDL_AUTH=TIDDL_AUTH)
+            try:
+                r = subprocess.run([TIDDL, "auth", "refresh", "--force"],
+                                   capture_output=True, text=True, env=env, timeout=120)
+            except subprocess.TimeoutExpired:
+                # The child is killed here, and tiddl has already truncated the file if it got that
+                # far. This is the most likely way the credential was lost in the first place.
+                _log("tidal: token refresh timed out and was killed; repairing the session")
+                self.heal()
+                return False
+            if r.returncode != 0:
+                _log(f"tidal: token refresh FAILED (exit {r.returncode}) — Tidal will return "
+                     f"nothing until re-authenticated: {(r.stdout + r.stderr).strip()[-200:]}")
+                self.heal()
+                return False
+            self._snapshot()
+            return True
 
     def search(self, want):
         try:
@@ -196,8 +321,8 @@ class Soulseek:
     def status(self):
         missing = [n for n, v in (("SLSKD_URL", SLSKD_URL), ("SLSKD_API_KEY", SLSKD_KEY)) if not v]
         if missing:
-            return False, f"{' and '.join(missing)} not set"
-        return True, "configured"
+            return False, False, f"{' and '.join(missing)} not set"
+        return True, True, "configured"
 
     def _api(self, method, path, body=None):
         req = urllib.request.Request(
@@ -280,11 +405,13 @@ class YouTube:
 
     def status(self):
         if shutil.which(YTDLP) is None and not os.path.exists(YTDLP):
-            return False, f"{YTDLP} not found"
-        # Not fatal — public videos download without them — but the age-restricted and
-        # region-locked material is exactly what YouTube is the last resort for.
-        return True, ("configured" if os.path.exists(COOKIES) else
-                      f"configured; no cookies at {COOKIES}, so age-restricted videos will fail")
+            return False, False, f"{YTDLP} not found"
+        # Usable without cookies — public videos download fine — but not healthy: age-restricted
+        # and region-locked material is exactly what YouTube is the last resort for.
+        if not os.path.exists(COOKIES):
+            return True, False, (f"no cookies at {COOKIES}, so age-restricted and region-locked "
+                                 "videos will fail")
+        return True, True, "configured"
 
     def _cookie_args(self):
         return ["--cookies", COOKIES] if os.path.exists(COOKIES) else []
@@ -343,12 +470,15 @@ ALL = [Tidal(), Soulseek(), YouTube()]
 def enabled():
     """Providers usable right now, in preference order, with why each is or isn't available.
 
-    ``detail`` is the reason in words. A provider dropping off this list used to show only as a
-    shorter log line, which reads the same as a provider that was never configured.
+    ``available`` is whether acquisition may use it; ``healthy`` is whether anything is wrong;
+    ``detail`` is the reason in words. The two booleans differ for a provider that still works but
+    is running on a repaired credential or without cookies — states that would otherwise show as
+    "fine", which is how a degraded run goes unnoticed. A provider dropping off this list used to
+    show only as a shorter log line, indistinguishable from one that was never configured.
     """
     out = []
     for p in ALL:
-        ok, detail = p.status()
+        ok, healthy, detail = p.status()
         out.append({"name": p.name, "hint": p.quality_hint, "available": ok,
-                    "detail": detail, "provider": p})
+                    "healthy": healthy, "detail": detail, "provider": p})
     return out

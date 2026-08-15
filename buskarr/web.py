@@ -156,22 +156,34 @@ def overview(request: Request, msg: str = ""):
     want_rows = "".join(
         f"<tr><th scope='row'>{esc(k)}</th><td>{v}</td></tr>"
         for k, v in sorted(s["wants"].items())) or "<tr><td colspan='2'>No requests yet.</td></tr>"
+    def _prov_state(p):
+        return "usable" if p["healthy"] else ("DEGRADED" if p["available"] else "UNUSABLE")
+
     prov_rows = "".join(
         f"<tr><th scope='row'>{esc(p['name'])}</th>"
-        f"<td>{'usable' if p['available'] else 'UNUSABLE'} — {esc(p['detail'])}</td>"
+        f"<td>{_prov_state(p)} — {esc(p['detail'])}</td>"
         f"<td>{esc(p['hint'])}</td></tr>" for p in provs)
     # Placed above the statistics rather than beside the table, because the symptom of a dead
     # provider is silent: downloads keep succeeding at whatever the next provider down the ladder
     # offers, so nothing on this page looks wrong unless the loss is stated outright. First thing
     # under the heading is where it gets read.
     down = [p for p in provs if not p["available"]]
-    prov_warning = ("<p class=\"warn\"><strong>Reduced quality: "
-                    + esc(", ".join(p["name"] for p in down))
-                    + (" is" if len(down) == 1 else " are")
-                    + " not usable right now.</strong> Songs still download, but from further "
-                    "down the provider list, which usually means a worse codec. "
-                    + esc("; ".join(f"{p['name']}: {p['detail']}" for p in down))
-                    + "</p>") if down else ""
+    sick = [p for p in provs if p["available"] and not p["healthy"]]
+    parts = []
+    if down:
+        parts.append("<p class=\"warn\"><strong>Reduced quality: "
+                     + esc(", ".join(p["name"] for p in down))
+                     + (" is" if len(down) == 1 else " are")
+                     + " not usable right now.</strong> Songs still download, but from further "
+                     "down the provider list, which usually means a worse codec. "
+                     + esc("; ".join(f"{p['name']}: {p['detail']}" for p in down)) + "</p>")
+    if sick:
+        # Separate from the block above on purpose. These still download at full quality, so
+        # wording them as a quality loss would train the warning to be ignored.
+        parts.append("<p class=\"warn\"><strong>Working, but needs attention: "
+                     + esc(", ".join(p["name"] for p in sick)) + ".</strong> "
+                     + esc("; ".join(f"{p['name']}: {p['detail']}" for p in sick)) + "</p>")
+    prov_warning = "".join(parts)
     body = f"""
 <h2>Overview</h2>
 {prov_warning}
