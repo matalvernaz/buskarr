@@ -9,6 +9,7 @@ sends nothing.
 import os
 import sys
 import tempfile
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -63,6 +64,19 @@ check("protocols=('usenet',) excludes torrents entirely",
 # The seeder gate must survive for torrents; dropping it wholesale would grab dead releases.
 check("an unseeded TORRENT is still refused",
       grab.pick_release([r for r in releases if r["guid"] == "dead"], "AJ", "Alb1") is None)
+# A concert DVD in the audio category passes artist, album and size, and contains no audio file at
+# all. One was grabbed live before this gate existed.
+print("  -- video releases in the audio category --")
+for title, is_vid in (("CMT Invitation Only - Alan Jackson HD XviD", True),
+                      ("Alan Jackson-Chattahoochee-Opry 100 Years-720p-x264-2025", True),
+                      ("Some Band - Live At Wembley 1080p BluRay", True),
+                      ("Alan Jackson-Live At Texas Stadium-02-CD-FLAC-2007-6DM", False),
+                      ("Avicii - True [FLAC]", False),
+                      ("Kaylee Rose-Kaylee Rose-EP-WEB-2012-KNOWN", False)):
+    check(f"{'video' if is_vid else 'audio'}: {title[:52]}", grab.is_video(title) is is_vid)
+check("a video release is refused even with perfect artist and album evidence",
+      grab.pick_release([rel("AJ - Alb1 HD XviD", guid="vid")], "AJ", "Alb1") is None)
+
 check("tiny, huge, wrong-artist and wrong-album refused on both protocols",
       grab.pick_release([r for r in releases
                          if r["guid"] in ("tiny", "huge", "wrongartist", "wrongalbum")],
@@ -134,6 +148,58 @@ with tempfile.TemporaryDirectory() as d:
         check("--regrab grabs it again", r["grabbed"] == 1 and len(posts) == 2, str(r))
     finally:
         grab.PROWLARR_API_KEY = old_key
+
+print("\n=== an album nothing fits is remembered, so it stops eating the cap ===")
+with tempfile.TemporaryDirectory() as d:
+    conn = db.init(os.path.join(d, "t.db"))
+    wid, _ = db.add_want(conn, "AJ", "Track 1", "NoSuchAlbum", "1999", 100.0)
+    conn.execute("UPDATE wants SET status=? WHERE id=?", (db.STATUS_UNAVAILABLE, wid))
+    conn.commit()
+    searches = []
+
+    def barren_api(path, body=None):
+        searches.append(path)
+        return []                       # the indexers simply do not carry it
+
+    old_key = grab.PROWLARR_API_KEY
+    grab.PROWLARR_API_KEY = "test"
+    try:
+        grab.sweep(conn, dry_run=False, api=barren_api, log=lambda m: None)
+        check("the miss is recorded",
+              conn.execute("SELECT COUNT(*) FROM grab_attempts").fetchone()[0] == 1)
+        n = len(searches)
+        r = grab.sweep(conn, dry_run=False, api=barren_api, log=lambda m: None)
+        # Without this the same unfindable album is the permanent head of a most-missing-first
+        # queue: re-searched every cycle, and everything below it never examined at all.
+        check("the next sweep does not search it again", len(searches) == n, str(searches))
+        check("it is reported as cooling, not as nothing-to-do", r["albums"] == 0, str(r))
+    finally:
+        grab.PROWLARR_API_KEY = old_key
+
+print("\n=== an ambiguous dispatch failure must not free the album for a second grab ===")
+for label, exc, expect_row in (
+        ("timeout keeps the record", TimeoutError("timed out"), 1),
+        ("refused connection withdraws it",
+         urllib.error.URLError(ConnectionRefusedError("refused")), 0)):
+    with tempfile.TemporaryDirectory() as d:
+        conn = db.init(os.path.join(d, "t.db"))
+        wid, _ = db.add_want(conn, "AJ", "Track 1", "Alb1", "1999", 100.0)
+        conn.execute("UPDATE wants SET status=? WHERE id=?", (db.STATUS_UNAVAILABLE, wid))
+        conn.commit()
+
+        def failing_api(path, body=None, _exc=exc):
+            if body is not None:
+                raise _exc
+            return [rel("AJ - Alb1 FLAC", guid="flac")]
+
+        old_key = grab.PROWLARR_API_KEY
+        grab.PROWLARR_API_KEY = "test"
+        try:
+            grab.sweep(conn, dry_run=False, api=failing_api, log=lambda m: None)
+            got = conn.execute("SELECT COUNT(*) FROM grabs").fetchone()[0]
+            check(label, got == expect_row, f"rows={got}, wanted {expect_row}")
+        finally:
+            grab.PROWLARR_API_KEY = old_key
 
 print(f"\n{bad} failure(s)")
 sys.exit(1 if bad else 0)

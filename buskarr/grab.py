@@ -25,7 +25,9 @@ what exists) but grabs nothing.
 """
 import json
 import os
+import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -42,10 +44,32 @@ MIN_SEEDERS = 1
 # whose completed directory harvest already walks. Callers narrow this: the worker's automatic
 # sweep is torrent-only, because usenet grabs stay a deliberate act for now.
 PROTOCOLS = ("torrent", "usenet")
+# How long an album that produced no fitting release is left alone. Indexers do acquire things, so
+# this is a cooldown rather than a permanent verdict — but re-asking every 30 minutes forever is
+# both useless and rude to the trackers, and it starves everything below it in the queue.
+MISS_COOLDOWN = int(os.environ.get("GRAB_MISS_COOLDOWN", str(7 * 24 * 3600)))
+# Indexers mis-categorise, and concert DVDs and music videos land in the audio category often
+# enough to matter: an automatic sweep grabbed 'CMT Invitation Only - Alan Jackson HD XviD' on
+# 2026-08-15 — right artist, right album title, plausible size, and not one audio file in it.
+# Matched as whole TOKENS, never substrings, so "avi" inside "Avicii" stays an artist. `dvd` alone
+# is deliberately absent: a CD+DVD edition is still half an album.
+VIDEO_MARKERS = frozenset("""
+    xvid divx x264 x265 h264 h265 hevc avc
+    480p 576p 720p 1080p 2160p uhd
+    bdrip brrip dvdrip webrip hdtv pdtv dvdr dvd5 dvd9 bluray
+    avi mkv vob m2ts
+""".split())
+
+
 # A plausible album is megabytes to a few gigabytes. Outside that is a single stray track or a
 # discography dump, and a discography torrent for one album's worth of wants is bad ratio spent.
 MIN_SIZE = 30 * 1024 * 1024
 MAX_SIZE = 4 * 1024 * 1024 * 1024
+
+
+def is_video(title):
+    """True if a release title advertises video. Audio-only releases never carry these tokens."""
+    return bool(VIDEO_MARKERS & set(re.split(r"[^a-z0-9]+", (title or "").lower())))
 
 
 def log(msg):
@@ -101,6 +125,32 @@ def adopt_torrents(qbit=_qbit, log=log):
     return len(strays)
 
 
+def _definitely_not_sent(exc):
+    """True only when a dispatch failure PROVES Prowlarr never accepted the release.
+
+    An ``HTTPError`` means Prowlarr answered with a status: it handled the request and refused it.
+    A refused connection means nothing was delivered at all. Everything else — a timeout above all —
+    is ambiguous, because the grab may have been queued and only the response lost. Treating an
+    ambiguous failure as "not sent" is how one album gets grabbed twice, which on a private tracker
+    is ratio spent twice for one download.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(exc.reason, ConnectionRefusedError)
+    return False
+
+
+def record_miss(conn, key, artist, album, results):
+    """Remember that this album was searched and nothing fit."""
+    conn.execute(
+        "INSERT INTO grab_attempts (album_key, artist, album, results, last_attempt)"
+        " VALUES (?,?,?,?,?) ON CONFLICT(album_key) DO UPDATE SET"
+        " results=excluded.results, last_attempt=excluded.last_attempt",
+        (key, artist, album, results, time.time()))
+    conn.commit()
+
+
 def album_key(lead, album):
     return f"{db.norm(lead or '')}|{db.strict_norm(album or '')}"
 
@@ -145,6 +195,8 @@ def pick_release(releases, artist, album, protocols=PROTOCOLS):
         if not MIN_SIZE <= size <= MAX_SIZE:
             continue
         title = r.get("title") or ""
+        if is_video(title):
+            continue
         if not match.artist_ok(artist, title):
             continue
         if not match.title_ok(album, title, "", artist):
@@ -178,15 +230,23 @@ def sweep(conn, dry_run=True, limit=0, regrab=False, protocols=PROTOCOLS, api=_a
         # hand, a permanent stall on the worker's automatic path, which always sees the same
         # most-missing albums first.
         fresh = []
+        cooling = 0
+        floor = time.time() - MISS_COOLDOWN
         for g in groups:
-            if conn.execute("SELECT 1 FROM grabs WHERE album_key=?",
-                            (album_key(g["lead"], g["album"]),)).fetchone():
+            key = album_key(g["lead"], g["album"])
+            if conn.execute("SELECT 1 FROM grabs WHERE album_key=?", (key,)).fetchone():
                 already += 1
+            elif conn.execute("SELECT 1 FROM grab_attempts WHERE album_key=? AND last_attempt>?",
+                              (key, floor)).fetchone():
+                cooling += 1
             else:
                 fresh.append(g)
         groups = fresh
         if already:
             log(f"{already} album(s) already grabbed; --regrab to grab them again")
+        if cooling:
+            log(f"{cooling} album(s) searched recently with no fitting release; retried after "
+                f"{MISS_COOLDOWN // 86400}d")
         if not groups:
             log("nothing left to grab")
             return {"albums": 0, "grabbed": 0, "already": already}
@@ -208,6 +268,10 @@ def sweep(conn, dry_run=True, limit=0, regrab=False, protocols=PROTOCOLS, api=_a
         if not best:
             log(f"  {lead} — {g['album']} ({g['missing']} missing): no fitting release "
                 f"among {len(releases)} result(s)")
+            if not dry_run:
+                # Recorded, or this album is the permanent head of a most-missing-first queue: the
+                # automatic sweep would re-search it every cycle and never reach anything below it.
+                record_miss(conn, key, g["artist"], g["album"], len(releases))
             continue
         size_gb = (best.get("size") or 0) / 1e9
         proto = (best.get("protocol") or "").lower()
@@ -219,17 +283,31 @@ def sweep(conn, dry_run=True, limit=0, regrab=False, protocols=PROTOCOLS, api=_a
         if dry_run:
             grabbed += 1
             continue
-        try:
-            # Prowlarr's grab action: it pushes the release to its configured download client.
-            api("search", {"guid": best["guid"], "indexerId": best["indexerId"]})
-        except Exception as e:
-            log(f"    grab failed ({type(e).__name__})")
-            continue
-        conn.execute(
+        # The record goes in and COMMITS before the dispatch. Dispatching first meant an accepted
+        # grab whose response timed out left the download client holding a release with no row to
+        # drive harvesting — and nothing to stop the next cycle grabbing the same album again.
+        cur = conn.execute(
             "INSERT INTO grabs (album_key, artist, artist_lead, album, release_title, indexer_id,"
             " guid, size, seeders, protocol, grabbed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (key, g["artist"], g["lead"], g["album"], best.get("title"), best.get("indexerId"),
              best.get("guid"), best.get("size"), best.get("seeders"), proto, time.time()))
+        gid = cur.lastrowid
+        conn.commit()
+        try:
+            # Prowlarr's grab action: it pushes the release to its configured download client.
+            api("search", {"guid": best["guid"], "indexerId": best["indexerId"]})
+        except Exception as e:
+            if _definitely_not_sent(e):
+                conn.execute("DELETE FROM grabs WHERE id=?", (gid,))
+                conn.commit()
+                log(f"    refused by prowlarr ({type(e).__name__}) — record withdrawn, the album "
+                    "stays eligible")
+            else:
+                log(f"    outcome unknown ({type(e).__name__}) — record kept so this album is not "
+                    "grabbed twice; harvest imports it if it did dispatch, and --regrab forces "
+                    "another attempt")
+                grabbed += 1
+            continue
         # The wants stay UNAVAILABLE — only harvest may say otherwise — but the note tells the
         # Wanted page why waiting is the right move.
         conn.execute(

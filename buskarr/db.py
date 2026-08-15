@@ -112,6 +112,18 @@ CREATE TABLE IF NOT EXISTS grabs (
     seeders        INTEGER,
     grabbed_at     REAL NOT NULL
 );
+
+-- A search that found nothing worth grabbing. Separate from `grabs` because a miss is not a grab
+-- and must not read as one, but it has to be remembered all the same: without it the albums no
+-- indexer carries are the permanent head of a most-missing-first queue, so an automatic sweep
+-- re-searches the same handful every cycle and never reaches anything below them.
+CREATE TABLE IF NOT EXISTS grab_attempts (
+    album_key      TEXT PRIMARY KEY,
+    artist         TEXT,
+    album          TEXT,
+    results        INTEGER,
+    last_attempt   REAL NOT NULL
+);
 """
 
 # Kept separate from the tables, and applied AFTER migrate(): files_normfile references

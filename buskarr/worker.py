@@ -557,6 +557,11 @@ def run_grabs(conn):
                        log=lambda m: log(f"  grab: {m}"))
     except Exception as e:
         # Contained exactly like a provider error: Prowlarr being down must not cost the cycle.
+        # The rollback is the important half: sweep commits per album, so an error between its
+        # INSERT and that commit leaves an implicit transaction open, and swallowing the exception
+        # without ending it holds the write lock across the whole INTERVAL sleep — every other
+        # connection then times out with "database is locked".
+        conn.rollback()
         log(f"  grab sweep failed: {type(e).__name__}: {e}")
         return 0
     return r.get("grabbed", 0)
@@ -597,13 +602,26 @@ def run_harvest(conn):
     try:
         harvest.harvest(conn, dry_run=False, log=lambda m: log(f"  {m}"))
     except Exception as e:
+        conn.rollback()             # same lock-leak hazard as run_grabs; harvest writes rows too
         log(f"  harvest failed: {type(e).__name__}: {e}")
         return 0
     retired = 0
     for gr in outstanding:
+        if gr["artist_lead"] is None:
+            # A grab recorded before `grabs.artist_lead` existed. Its wants carry a real lead, so
+            # the NULL-matching count below would find zero and retire it as delivered on the very
+            # first cycle after the upgrade — abandoning a download that may still be running.
+            # Let the window retire these instead.
+            continue
+        # Counted as "not yet in the library", NOT as "still unavailable". A want can leave
+        # UNAVAILABLE without this grab having delivered anything — Retry re-pends it, and the
+        # stale-queue reaper moves SEARCHING back to pending — and reading that as success stamps
+        # the grab, so nothing harvests the download when it finishes and the 7-day cleanup then
+        # deletes it. Retiring late costs a directory walk per cycle and is capped by
+        # HARVEST_WINDOW; retiring early loses the download for good.
         left = conn.execute(
-            "SELECT COUNT(*) n FROM wants WHERE status=? AND artist_lead IS ? AND album=?",
-            (db.STATUS_UNAVAILABLE, gr["artist_lead"], gr["album"])).fetchone()["n"]
+            "SELECT COUNT(*) n FROM wants WHERE status<>? AND artist_lead IS ? AND album=?",
+            (db.STATUS_HAVE, gr["artist_lead"], gr["album"])).fetchone()["n"]
         if not left:
             conn.execute("UPDATE grabs SET harvested_at=? WHERE id=?", (now, gr["id"]))
             retired += 1
@@ -621,6 +639,18 @@ def cycle(conn):
     # described behaviour the code did not have.
     if _job_thread is None or not _job_thread.is_alive():
         run_jobs(conn)
+    # Indexer work first, and unconditionally. It shares nothing with the track providers — the
+    # downloads come from qBittorrent and NZBGet — so it must not sit behind the "no providers
+    # available" return below. That state is exactly a rotted credential, which is a scenario this
+    # module already knows can last hours, and freezing harvest through it means completed grabs
+    # expire at the 7-day seed limit and are deleted with their files.
+    #
+    # Before the pending list is read, too: a grabbed release completes hours after the cycle that
+    # grabbed it, when there is usually nothing pending at all, and harvesting first means a want
+    # the import just satisfied is no longer in `rows` rather than being fetched a second time only
+    # to be discarded against the copy that had already landed.
+    run_harvest(conn)
+    run_grabs(conn)
     entries = providers.enabled()
     provs = [e for e in entries if e["available"]]
     # Named individually, because a credential that rots mid-life makes the provider disappear from
@@ -658,15 +688,6 @@ def cycle(conn):
     conn.commit()
     if stale:
         log(f"{stale} queued-at-peer want(s) timed out; back to pending")
-    # Indexer work runs before the pending list is read, and regardless of whether it is empty.
-    # Two reasons, both learned the hard way elsewhere in this file: a grabbed release completes
-    # hours after the cycle that grabbed it, when there is usually nothing pending at all — so an
-    # early return on a quiet cycle is exactly how a completed download would sit unimported until
-    # the 7-day seed limit expired and the cleanup deleted it. And harvesting first means a want
-    # the import just satisfied is no longer in `rows`, instead of being fetched a second time
-    # only to be discarded against the copy that had already landed.
-    run_harvest(conn)
-    run_grabs(conn)
     rows = conn.execute(
         "SELECT * FROM wants WHERE status IN (?,?) AND (retry_after IS NULL OR retry_after<?) "
         "ORDER BY requested_at LIMIT ?",

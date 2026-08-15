@@ -85,6 +85,47 @@ with tempfile.TemporaryDirectory() as d:
     check("the completed grab is stamped", harvested(conn, done) is not None)
     check("the short one is still waiting", harvested(conn, short) is None)
 
+    print("\n=== a want that merely LEFT unavailable is not proof of delivery ===")
+    # Retry re-pends an unavailable want, and the stale-queue reaper moves SEARCHING back to
+    # pending. Reading "no unavailable wants" as success stamps the grab, so nothing harvests the
+    # download when it finishes and the 7-day cleanup deletes it. Only HAVE means delivered.
+    calls.clear()
+    repended = add_grab(conn, "DJ", "Alb4")
+    want(conn, "DJ", "Alb4", "Track 1", db.STATUS_PENDING)
+    want(conn, "DJ", "Alb4", "Track 2", db.STATUS_SEARCHING)
+    worker.run_harvest(conn)
+    check("a re-pended want does not retire the grab", harvested(conn, repended) is None)
+
+    print("\n=== a grab from before the artist_lead column is not retired by the count ===")
+    # Pre-migration rows carry NULL, while their wants carry a real lead, so `artist_lead IS NULL`
+    # matches nothing and the grab would read as fully delivered on the first cycle after upgrade.
+    calls.clear()
+    legacy = add_grab(conn, "EJ", "Alb5")
+    conn.execute("UPDATE grabs SET artist_lead=NULL WHERE id=?", (legacy,))
+    conn.commit()
+    want(conn, "EJ", "Alb5", "Track 1", db.STATUS_UNAVAILABLE)
+    worker.run_harvest(conn)
+    check("a NULL-lead grab is left to the window, not retired", harvested(conn, legacy) is None)
+
+    print("\n=== a failure inside harvest must not leave a write lock open ===")
+    calls.clear()
+
+    def exploding_harvest(conn_, dry_run=True, limit=0, log=None):
+        conn_.execute("UPDATE grabs SET release_title='half-written' WHERE id=?", (legacy,))
+        raise RuntimeError("harvest blew up mid-write")
+
+    harvest_mod.harvest = exploding_harvest
+    try:
+        worker.run_harvest(conn)
+        check("the exception is contained", True)
+        check("no transaction is left open across the sleep", conn.in_transaction is False,
+              f"in_transaction={conn.in_transaction}")
+        check("the half-written change was rolled back",
+              conn.execute("SELECT release_title FROM grabs WHERE id=?",
+                           (legacy,)).fetchone()[0] != "half-written")
+    finally:
+        harvest_mod.harvest = fake_harvest
+
     print("\n=== a grab past the window is given up on, without harvesting for it ===")
     calls.clear()
     stale = add_grab(conn, "CJ", "Alb3", age_days=worker.HARVEST_WINDOW / 86400 + 1)

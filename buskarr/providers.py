@@ -75,12 +75,18 @@ def _atomic_copy(src, dest, mode=0o600):
 
 @contextlib.contextmanager
 def _flock(path):
-    """Hold an exclusive lock across a block, or proceed unlocked if one cannot be taken.
+    """Hold an exclusive lock across a block. Yields True if the lock was actually taken.
 
     The worker's cycle and a maintenance sweep are separate processes sharing one ``$HOME``, and
     both refresh the Tidal token. tiddl's writer truncates before it serialises, so two overlapping
     refreshes have a window where the file is empty. Refusing to refresh at all would be worse than
-    refreshing unlocked, so a lock failure is not fatal.
+    refreshing unlocked — the token expires in ~4h either way — so a lock failure is not fatal.
+
+    But the caller has to KNOW, because the two things done under this lock carry different risks.
+    Refreshing unlocked risks the live file, which ``heal`` repairs from a copy. Snapshotting
+    unlocked risks the copy itself: a concurrent refresh can truncate the live file between the
+    check and the copy, publishing an empty snapshot over the one credential recovery depends on,
+    and turning a transient overlap into a real re-authentication.
     """
     fh = None
     try:
@@ -91,7 +97,7 @@ def _flock(path):
             fh.close()
         fh = None
     try:
-        yield
+        yield fh is not None
     finally:
         if fh:
             try:
@@ -199,12 +205,25 @@ class Tidal:
         return bool(cls._usable(live) and _atomic_copy(live, TIDAL_AUTH_BACKUP))
 
     def _read_auth(self):
-        """The parsed session. Raises rather than returning a dict that cannot authenticate."""
-        with open(self._auth_path()) as fh:
-            auth = json.load(fh)
-        if not auth.get("token"):
-            raise KeyError("token")
-        return auth
+        """The parsed session. Raises rather than returning a dict that cannot authenticate.
+
+        Walks the sources rather than trusting ``_auth_path``: that call checks a file and this one
+        reopens it, so a refresh truncating the live file in between would otherwise turn a search
+        into "Tidal has no results for this song" — the exact silent downgrade the rest of this
+        class exists to prevent. Falling through to the snapshot costs nothing when the live file
+        is fine, because it is tried first.
+        """
+        last = None
+        for path in self._sources():
+            try:
+                with open(path) as fh:
+                    auth = json.load(fh)
+                if not auth.get("token"):
+                    raise KeyError("token")
+                return auth
+            except (OSError, json.JSONDecodeError, KeyError) as e:
+                last = e
+        raise last if last else OSError("no auth sources configured")
 
     def refresh(self):
         """Tidal access tokens last ~4h, so every run refreshes before doing anything.
@@ -226,7 +245,7 @@ class Tidal:
         process, and two truncate-then-write cycles overlapping is a way to lose the credential
         that no amount of care inside one process prevents.
         """
-        with _flock(TIDAL_REFRESH_LOCK):
+        with _flock(TIDAL_REFRESH_LOCK) as locked:
             self.heal()
             env = dict(os.environ, TIDDL_AUTH=TIDDL_AUTH)
             try:
@@ -243,7 +262,14 @@ class Tidal:
                      f"nothing until re-authenticated: {(r.stdout + r.stderr).strip()[-200:]}")
                 self.heal()
                 return False
-            self._snapshot()
+            if locked:
+                self._snapshot()
+            else:
+                # Without the lock a concurrent refresh can truncate the live file between the
+                # check and the copy. Keeping the previous snapshot — stale by at most one refresh
+                # — beats overwriting the recovery copy with an empty one.
+                _log("tidal: refreshed without the lock; snapshot skipped to protect the copy "
+                     "heal() restores from")
             return True
 
     def search(self, want):
