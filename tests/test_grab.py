@@ -30,10 +30,15 @@ def rel(title, protocol="torrent", seeders=5, size=500 * 1024 * 1024, guid="g1",
 
 
 print("=== pick_release gates and preferences ===")
+# A real NZB carries no seeders at all. Faking one with seeders=0 would be a torrent that happens
+# to be dead; the awkward truth being modelled is that the FIELD IS ABSENT, which is exactly what
+# the old torrent-shaped gate rejected on every usenet release.
+nzb = rel("AJ - Alb1 FLAC", protocol="usenet", guid="usenet")
+del nzb["seeders"]
 releases = [
     rel("AJ - Alb1 [MP3 320]", seeders=50, guid="mp3"),
     rel("AJ - Alb1 FLAC", seeders=3, guid="flac"),
-    rel("AJ - Alb1 FLAC", protocol="usenet", seeders=999, guid="usenet"),
+    nzb,
     rel("AJ - Alb1 FLAC", seeders=0, guid="dead"),
     rel("AJ - Alb1 FLAC", size=10 * 1024 * 1024, guid="tiny"),
     rel("AJ - Alb1 FLAC", size=9 * 1024 * 1024 * 1024, guid="huge"),
@@ -41,10 +46,26 @@ releases = [
     rel("AJ - Different Record FLAC", seeders=80, guid="wrongalbum"),
 ]
 best = grab.pick_release(releases, "AJ", "Alb1")
-check("lossless beats a better-seeded MP3", best and best["guid"] == "flac",
-      str(best and best["guid"]))
-check("usenet, unseeded, tiny, huge, wrong-artist, wrong-album all refused",
-      grab.pick_release([r for r in releases if r["guid"] != "flac" and r["guid"] != "mp3"],
+check("a seederless NZB is eligible at all", best is not None)
+check("usenet wins the tie — no ratio spent, no obligation left behind",
+      best and best["guid"] == "usenet", str(best and best["guid"]))
+
+torrent_only = grab.pick_release(releases, "AJ", "Alb1", protocols=("torrent",))
+check("lossless beats a better-seeded MP3",
+      torrent_only and torrent_only["guid"] == "flac", str(torrent_only and torrent_only["guid"]))
+# The worker's automatic sweep passes exactly this, so usenet stays a deliberate act.
+check("protocols=('torrent',) excludes usenet entirely",
+      torrent_only and torrent_only["guid"] != "usenet")
+usenet_only = grab.pick_release(releases, "AJ", "Alb1", protocols=("usenet",))
+check("protocols=('usenet',) excludes torrents entirely",
+      usenet_only and usenet_only["guid"] == "usenet", str(usenet_only and usenet_only["guid"]))
+
+# The seeder gate must survive for torrents; dropping it wholesale would grab dead releases.
+check("an unseeded TORRENT is still refused",
+      grab.pick_release([r for r in releases if r["guid"] == "dead"], "AJ", "Alb1") is None)
+check("tiny, huge, wrong-artist and wrong-album refused on both protocols",
+      grab.pick_release([r for r in releases
+                         if r["guid"] in ("tiny", "huge", "wrongartist", "wrongalbum")],
                         "AJ", "Alb1") is None)
 
 print("\n=== adopt_torrents flips only unmanaged torrents ===")

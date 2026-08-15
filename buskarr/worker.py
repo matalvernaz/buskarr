@@ -16,7 +16,7 @@ import time
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
 
-from . import bulk, credit, db, match, providers
+from . import bulk, credit, db, grab, match, providers
 
 LIBRARY = os.environ.get("LIBRARY_DIR", "/music")
 STAGING = os.environ.get("STAGING_DIR", "/state/staging")
@@ -35,6 +35,22 @@ NUDGE_POLL = 5
 # offline, or the queue never drained. Without an age-out, a want in SEARCHING is selected by no
 # query at all and is stuck forever; harvest still imports the file if it turns up late.
 SEARCH_STALE = int(os.environ.get("SEARCH_STALE", str(48 * 3600)))
+# Indexer grabs run from the cycle, but TORRENT ONLY. A usenet grab costs nothing but a download,
+# and is still a deliberate act via `python3 -m buskarr.grab --apply`; a torrent grab spends tracker
+# ratio, so the automatic path is the one that must be capped rather than the free one. Set
+# GRAB_PER_CYCLE=0 to turn automatic grabbing off entirely.
+GRAB_PER_CYCLE = int(os.environ.get("GRAB_PER_CYCLE", "3"))
+GRAB_PROTOCOLS = tuple(p.strip().lower() for p in
+                       os.environ.get("GRAB_PROTOCOLS", "torrent").split(",") if p.strip())
+# A grabbed release is only useful once harvest has mined it, and it does not survive indefinitely:
+# the shared qBittorrent stops a torrent at the 7-day seed limit and an hourly cleanup then deletes
+# it WITH ITS FILES. Harvesting on our own schedule is what stops a completed download expiring
+# unimported while its wants sit UNAVAILABLE.
+HARVEST_AUTO = os.environ.get("HARVEST_AUTO", "1") not in ("0", "", "false", "no")
+# How long to keep re-checking a grab that has not delivered. Past the 7-day seed limit and the
+# cleanup that follows it, the download no longer exists to import, so continuing to harvest for it
+# every cycle is work with no possible result.
+HARVEST_WINDOW = int(os.environ.get("HARVEST_WINDOW", str(10 * 24 * 3600)))
 
 
 def log(msg):
@@ -525,6 +541,78 @@ def job_loop():
             time.sleep(JOB_POLL)
 
 
+def run_grabs(conn):
+    """Grab indexer releases for the wants no provider carries. Returns how many were grabbed.
+
+    Torrent-only by default and capped per cycle. This is the only unattended path in the project
+    that spends something finite — private-tracker ratio — so the cap bounds what a large backlog
+    can do on its first pass. It is not re-spent on the same albums: the ``grabs`` table refuses a
+    second grab of an album, and that filter is applied before the cap so the sweep works down the
+    list instead of re-examining the same most-missing albums forever.
+    """
+    if GRAB_PER_CYCLE <= 0 or not grab.available():
+        return 0
+    try:
+        r = grab.sweep(conn, dry_run=False, limit=GRAB_PER_CYCLE, protocols=GRAB_PROTOCOLS,
+                       log=lambda m: log(f"  grab: {m}"))
+    except Exception as e:
+        # Contained exactly like a provider error: Prowlarr being down must not cost the cycle.
+        log(f"  grab sweep failed: {type(e).__name__}: {e}")
+        return 0
+    return r.get("grabbed", 0)
+
+
+def run_harvest(conn):
+    """Import completed grabs. Returns how many grabs were retired.
+
+    Harvesting by hand was a hazard rather than an inconvenience. The shared qBittorrent stops a
+    torrent at the 7-day seed limit and an hourly cleanup then deletes it WITH ITS FILES, so a grab
+    nobody harvested in time was simply lost — while its wants sat UNAVAILABLE carrying a note that
+    asked for a command to be run.
+
+    A grab is retired when its album has no unavailable wants left, meaning harvest delivered, or
+    when it ages past HARVEST_WINDOW, by which point there is nothing left on disk to import.
+    Retiring matters as much as harvesting: without it every past grab would re-walk the download
+    tree on every cycle forever.
+    """
+    if not HARVEST_AUTO:
+        return 0
+    now = time.time()
+    outstanding = conn.execute(
+        "SELECT id, artist_lead, album FROM grabs WHERE harvested_at IS NULL AND grabbed_at > ?",
+        (now - HARVEST_WINDOW,)).fetchall()
+    expired = conn.execute(
+        "UPDATE grabs SET harvested_at=? WHERE harvested_at IS NULL AND grabbed_at <= ?",
+        (now, now - HARVEST_WINDOW)).rowcount
+    # Unconditional, per the implicit-transaction rule: a zero-row UPDATE still opens one, and an
+    # uncommitted transaction here is a write lock held across the whole INTERVAL sleep.
+    conn.commit()
+    if expired:
+        log(f"  {expired} grab(s) never delivered within {HARVEST_WINDOW // 86400} days; "
+            "no longer waiting on them")
+    if not outstanding:
+        return 0
+    log(f"  {len(outstanding)} grab(s) awaiting import — harvesting")
+    from . import harvest                  # deferred: harvest imports this module
+    try:
+        harvest.harvest(conn, dry_run=False, log=lambda m: log(f"  {m}"))
+    except Exception as e:
+        log(f"  harvest failed: {type(e).__name__}: {e}")
+        return 0
+    retired = 0
+    for gr in outstanding:
+        left = conn.execute(
+            "SELECT COUNT(*) n FROM wants WHERE status=? AND artist_lead IS ? AND album=?",
+            (db.STATUS_UNAVAILABLE, gr["artist_lead"], gr["album"])).fetchone()["n"]
+        if not left:
+            conn.execute("UPDATE grabs SET harvested_at=? WHERE id=?", (now, gr["id"]))
+            retired += 1
+    conn.commit()
+    if retired:
+        log(f"  {retired} grab(s) fully imported")
+    return retired
+
+
 def cycle(conn):
     # Backstop only, and now actually conditional. Calling it unconditionally made this a SECOND
     # active runner: with more queued jobs than one claim batch, the thread and this loop both ran
@@ -570,6 +658,15 @@ def cycle(conn):
     conn.commit()
     if stale:
         log(f"{stale} queued-at-peer want(s) timed out; back to pending")
+    # Indexer work runs before the pending list is read, and regardless of whether it is empty.
+    # Two reasons, both learned the hard way elsewhere in this file: a grabbed release completes
+    # hours after the cycle that grabbed it, when there is usually nothing pending at all — so an
+    # early return on a quiet cycle is exactly how a completed download would sit unimported until
+    # the 7-day seed limit expired and the cleanup deleted it. And harvesting first means a want
+    # the import just satisfied is no longer in `rows`, instead of being fetched a second time
+    # only to be discarded against the copy that had already landed.
+    run_harvest(conn)
+    run_grabs(conn)
     rows = conn.execute(
         "SELECT * FROM wants WHERE status IN (?,?) AND (retry_after IS NULL OR retry_after<?) "
         "ORDER BY requested_at LIMIT ?",

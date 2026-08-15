@@ -194,6 +194,16 @@ MIGRATIONS = [
     # whatever release the provider happened to serve — which gave one completed album two
     # "05" files and no "04".
     ("wants", "track_no", "INTEGER"),
+    # Which protocol a release was grabbed over. `seeders` is meaningless on a usenet grab, so
+    # without this the two are indistinguishable in the record after the fact.
+    ("grabs", "protocol", "TEXT"),
+    # When harvest last imported for this grab. NULL means the download has not been mined yet,
+    # which is what the worker's automatic harvest selects on.
+    ("grabs", "harvested_at", "REAL"),
+    # The lead credit the grab was made for. `artist` is the full credit; this is the key the wants
+    # are actually stored under, so "has this grab delivered yet" can be asked with the same
+    # (artist_lead, album) pair every other query uses.
+    ("grabs", "artist_lead", "TEXT"),
 ]
 
 
