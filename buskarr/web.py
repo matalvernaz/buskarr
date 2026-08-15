@@ -521,14 +521,31 @@ def search_form(request: Request, q: str = "", msg: str = "", mode: str = "all")
     return page("Add music", body, user_of(request), msg)
 
 
+def _nudge():
+    """Ask the worker to start a cycle now instead of at the end of its sleep. True if signalled.
+
+    Every path that queues something wantable calls this, or the want sits idle for up to a full
+    INTERVAL — half an hour on this deployment — with nothing in the UI to say so.
+    """
+    try:
+        open(NUDGE, "w").close()
+        return True
+    except OSError:
+        return False
+
+
+# Appended to the confirmation of anything that queued a want, so the message never leaves the
+# question of when it starts unanswered — that silence is what the nudge existed to fix.
+NUDGED_NOTE = " Searching for it now — it appears under Activity within a minute or two."
+UNNUDGED_NOTE = (" The worker could not be signalled, so the search starts on its next cycle, "
+                 "within half an hour.")
+
+
 @app.post("/search-now")
 def search_now(request: Request):
     """Ask the worker for an early cycle. The web process never fetches anything itself."""
-    try:
-        open(NUDGE, "w").close()
-        note = "Searching now — check Activity in a minute or two."
-    except OSError as e:
-        note = f"Could not signal the worker: {type(e).__name__}"
+    note = ("Searching now — check Activity in a minute or two." if _nudge() else
+            "Could not signal the worker. It searches on its next cycle, within half an hour.")
     db.log_event(db.connect(), "nudge", None, user_of(request) or "")
     return RedirectResponse(f"/wants?msg={urllib.parse.quote(note)}", status_code=303)
 
@@ -544,10 +561,7 @@ def _enqueue(request, kind, ref, source, label):
     conn = db.connect()
     db.add_job(conn, kind, ref, source, label, user_of(request))
     db.log_event(conn, "queued-add", label, f"{kind} from {source}")
-    try:
-        open(NUDGE, "w").close()
-    except OSError:
-        pass                    # the worker still picks it up on its next cycle
+    _nudge()                    # if it fails the worker still picks the job up on its next cycle
     note = (f"Adding {label} from {source} — the worker starts within a few seconds and adds "
             "tracks as it goes. Progress is under Adds in progress below; reload this page to "
             "see it advance.")
@@ -581,15 +595,17 @@ def create_want(request: Request, artist: str = Form(...), title: str = Form(...
                               user_of(request), allow_dup=bool(allow_dup))
     db.log_event(conn, "added" if created else "already-wanted",
                  f"{artist} - {title}", user_of(request))
+    row = conn.execute("SELECT status FROM wants WHERE id=?", (wid,)).fetchone()
     if not created:
         note = f"“{title}” by {artist} was already on the list."
-    elif allow_dup:
-        note = f"Added “{title}” by {artist} as an extra copy — duplicate check bypassed."
+    elif row and row["status"] == db.STATUS_HAVE:
+        note = f"“{title}” by {artist} is already on disk, so nothing will be fetched."
     else:
-        row = conn.execute("SELECT status FROM wants WHERE id=?", (wid,)).fetchone()
-        note = (f"“{title}” by {artist} is already on disk, so nothing will be fetched."
-                if row and row["status"] == db.STATUS_HAVE
-                else f"Added “{title}” by {artist}.")
+        # The bulk paths have nudged since they moved off the request path; this one never did, so
+        # a single added song was the only thing in the project that waited out a whole INTERVAL.
+        note = ((f"Added “{title}” by {artist} as an extra copy — duplicate check bypassed."
+                 if allow_dup else f"Added “{title}” by {artist}.")
+                + (NUDGED_NOTE if _nudge() else UNNUDGED_NOTE))
     return RedirectResponse(f"/wants?msg={urllib.parse.quote(note)}", status_code=303)
 
 
@@ -1007,8 +1023,8 @@ def retry(request: Request, wid: int):
                  "note='retry requested' WHERE id=?", (db.STATUS_PENDING, wid))
     conn.commit()
     db.log_event(conn, "retry", f"{row['artist']} - {row['title']}", user_of(request))
-    return RedirectResponse("/wants?msg=" + urllib.parse.quote(
-        "Queued for another attempt on the next cycle."), status_code=303)
+    note = "Queued for another attempt." + (NUDGED_NOTE if _nudge() else UNNUDGED_NOTE)
+    return RedirectResponse(f"/wants?msg={urllib.parse.quote(note)}", status_code=303)
 
 
 def _file_token(path):
