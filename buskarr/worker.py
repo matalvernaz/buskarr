@@ -533,7 +533,14 @@ def cycle(conn):
     # described behaviour the code did not have.
     if _job_thread is None or not _job_thread.is_alive():
         run_jobs(conn)
-    provs = [e for e in providers.enabled() if e["available"]]
+    entries = providers.enabled()
+    provs = [e for e in entries if e["available"]]
+    # Named individually, because a credential that rots mid-life makes the provider disappear from
+    # the line below — which looks identical to a provider that was never set up. Downloads then
+    # keep succeeding at a worse codec and nothing marks the day it changed.
+    for e in entries:
+        if not e["available"]:
+            log(f"provider {e['name']} UNAVAILABLE: {e['detail']}")
     if not provs:
         log("no providers available — nothing to do")
         return 0

@@ -52,7 +52,27 @@ class Tidal:
     quality_hint = "FLAC 16/44"
 
     def available(self):
-        return bool(TIDDL_AUTH) and os.path.exists(self._auth_path())
+        return self.status()[0]
+
+    def status(self):
+        """``(usable, why)`` — the credential must PARSE, not merely exist.
+
+        Testing existence alone let a zero-byte ``auth.json`` report the provider available while
+        every search returned nothing, so acquisition fell through to a lossy provider for as long
+        as it took someone to notice a codec. The file is the thing that rots here, so the check
+        has to read it.
+        """
+        if not TIDDL_AUTH:
+            return False, "TIDDL_AUTH is not set"
+        try:
+            self._read_auth()
+        except OSError as e:
+            return False, (f"no readable auth file at {self._auth_path()} ({type(e).__name__}) — "
+                           "re-authenticate with: tiddl auth login")
+        except (json.JSONDecodeError, KeyError):
+            return False, (f"auth file at {self._auth_path()} is not a usable session — "
+                           "re-authenticate with: tiddl auth login")
+        return True, "authenticated"
 
     @staticmethod
     def _auth_path():
@@ -63,28 +83,53 @@ class Tidal:
         refresh, so reading the seed means presenting a token that expires ~4h after the container
         was first built and never recovers: searches 401 forever and every acquisition silently
         falls back to a lossy provider.
+
+        Size, not existence: a truncated live file is worth less than the seed, whose refresh token
+        may well still be good. tiddl rewrites this file in place, so an interrupted write leaves
+        zero bytes and the old ``os.path.exists`` test preferred that over a working credential.
         """
         live = os.path.join(os.path.expanduser("~"), ".tiddl", "auth.json")
-        return live if os.path.exists(live) else TIDAL_AUTH_JSON
+        try:
+            if os.path.getsize(live) > 0:
+                return live
+        except OSError:
+            pass
+        return TIDAL_AUTH_JSON
 
-    def _token(self):
+    def _read_auth(self):
+        """The parsed session. Raises rather than returning a dict that cannot authenticate."""
         with open(self._auth_path()) as fh:
-            return json.load(fh)
+            auth = json.load(fh)
+        if not auth.get("token"):
+            raise KeyError("token")
+        return auth
 
     def refresh(self):
-        """Tidal access tokens last ~4h, so every run refreshes before doing anything."""
+        """Tidal access tokens last ~4h, so every run refreshes before doing anything.
+
+        Success is the exit code. The previous test asked whether the output contained the word
+        "refresh", which the FAILURE path also satisfies — a dead credential prints a pydantic
+        trace mentioning it twice — so a broken token reported a successful refresh and the cycle
+        carried on believing Tidal was live.
+        """
         env = dict(os.environ, TIDDL_AUTH=TIDDL_AUTH)
         r = subprocess.run([TIDDL, "auth", "refresh", "--force"],
                            capture_output=True, text=True, env=env, timeout=120)
-        ok = "refresh" in (r.stdout + r.stderr).lower()
-        if not ok:
-            _log(f"tidal: token refresh unconfirmed: {(r.stdout + r.stderr).strip()[:140]}")
-        return ok
+        if r.returncode != 0:
+            _log(f"tidal: token refresh FAILED (exit {r.returncode}) — Tidal will return nothing "
+                 f"until re-authenticated: {(r.stdout + r.stderr).strip()[-200:]}")
+            return False
+        return True
 
     def search(self, want):
         try:
-            auth = self._token()
-        except (OSError, json.JSONDecodeError):
+            auth = self._read_auth()
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            # Never silent. An empty return here is indistinguishable from "Tidal does not have
+            # this song", which is exactly how a 12-hour credential outage went unnoticed while
+            # every acquisition quietly downgraded to YouTube.
+            _log(f"tidal: cannot read auth ({type(e).__name__}) at {self._auth_path()} — "
+                 "returning no results until re-authenticated")
             return []
         q = urllib.parse.urlencode({"query": f"{want['artist']} {want['title']}",
                                     "limit": SEARCH_N, "types": "TRACKS",
@@ -146,7 +191,13 @@ class Soulseek:
     GOOD_EXT = (".flac", ".m4a", ".mp3", ".ogg", ".opus")
 
     def available(self):
-        return bool(SLSKD_URL and SLSKD_KEY)
+        return self.status()[0]
+
+    def status(self):
+        missing = [n for n, v in (("SLSKD_URL", SLSKD_URL), ("SLSKD_API_KEY", SLSKD_KEY)) if not v]
+        if missing:
+            return False, f"{' and '.join(missing)} not set"
+        return True, "configured"
 
     def _api(self, method, path, body=None):
         req = urllib.request.Request(
@@ -225,7 +276,15 @@ class YouTube:
     quality_hint = "256k AAC with cookies, else ~130k"
 
     def available(self):
-        return shutil.which(YTDLP) is not None or os.path.exists(YTDLP)
+        return self.status()[0]
+
+    def status(self):
+        if shutil.which(YTDLP) is None and not os.path.exists(YTDLP):
+            return False, f"{YTDLP} not found"
+        # Not fatal — public videos download without them — but the age-restricted and
+        # region-locked material is exactly what YouTube is the last resort for.
+        return True, ("configured" if os.path.exists(COOKIES) else
+                      f"configured; no cookies at {COOKIES}, so age-restricted videos will fail")
 
     def _cookie_args(self):
         return ["--cookies", COOKIES] if os.path.exists(COOKIES) else []
@@ -282,9 +341,14 @@ ALL = [Tidal(), Soulseek(), YouTube()]
 
 
 def enabled():
-    """Providers usable right now, in preference order, with why each is or isn't available."""
+    """Providers usable right now, in preference order, with why each is or isn't available.
+
+    ``detail`` is the reason in words. A provider dropping off this list used to show only as a
+    shorter log line, which reads the same as a provider that was never configured.
+    """
     out = []
     for p in ALL:
-        out.append({"name": p.name, "hint": p.quality_hint, "available": bool(p.available()),
-                    "provider": p})
+        ok, detail = p.status()
+        out.append({"name": p.name, "hint": p.quality_hint, "available": ok,
+                    "detail": detail, "provider": p})
     return out

@@ -122,6 +122,8 @@ def page(title, body, user="", flash=""):
   dl.stats {{ display: grid; grid-template-columns: auto 1fr; gap: .25rem 1rem; }}
   dl.stats dt {{ font-weight: 600; }}
   .muted {{ opacity: .75; }}
+  /* Border and weight rather than colour alone, so it reads as a warning without relying on hue. */
+  .warn {{ padding: .5rem .75rem; border: 2px solid currentColor; }}
 </style>
 </head>
 <body>
@@ -156,10 +158,23 @@ def overview(request: Request, msg: str = ""):
         for k, v in sorted(s["wants"].items())) or "<tr><td colspan='2'>No requests yet.</td></tr>"
     prov_rows = "".join(
         f"<tr><th scope='row'>{esc(p['name'])}</th>"
-        f"<td>{'available' if p['available'] else 'not configured'}</td>"
+        f"<td>{'usable' if p['available'] else 'UNUSABLE'} — {esc(p['detail'])}</td>"
         f"<td>{esc(p['hint'])}</td></tr>" for p in provs)
+    # Placed above the statistics rather than beside the table, because the symptom of a dead
+    # provider is silent: downloads keep succeeding at whatever the next provider down the ladder
+    # offers, so nothing on this page looks wrong unless the loss is stated outright. First thing
+    # under the heading is where it gets read.
+    down = [p for p in provs if not p["available"]]
+    prov_warning = ("<p class=\"warn\"><strong>Reduced quality: "
+                    + esc(", ".join(p["name"] for p in down))
+                    + (" is" if len(down) == 1 else " are")
+                    + " not usable right now.</strong> Songs still download, but from further "
+                    "down the provider list, which usually means a worse codec. "
+                    + esc("; ".join(f"{p['name']}: {p['detail']}" for p in down))
+                    + "</p>") if down else ""
     body = f"""
 <h2>Overview</h2>
+{prov_warning}
 <dl class="stats">
   <dt>Tracks on disk</dt><dd>{s['files']}</dd>
   <dt>Lossless</dt><dd>{s['lossless']} ({(s['lossless'] / s['files'] * 100) if s['files'] else 0:.0f}%)</dd>
@@ -174,7 +189,9 @@ def overview(request: Request, msg: str = ""):
 
 <h3>Providers</h3>
 <table>
-<caption class="muted">Tried in this order; the first candidate that passes vetting wins.</caption>
+<caption class="muted">Tried in this order; the first candidate that passes vetting wins. A provider
+listed as UNUSABLE is skipped, and songs it would have supplied come from further down the list at
+whatever quality that source offers.</caption>
 <thead><tr><th scope="col">Provider</th><th scope="col">Status</th>
 <th scope="col">Typical quality</th></tr></thead>
 <tbody>{prov_rows}</tbody></table>
