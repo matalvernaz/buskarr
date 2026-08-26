@@ -39,6 +39,13 @@ RANK_UNKNOWN = 2
 # Compilations last. They are usually caught by the repackaging guard as well, but ordering them
 # last means the original release claims a song before a "greatest hits" can.
 RANK_COMPILATION = 5
+# A live take, a remix or a demo of a song is that song, so the studio release must claim the title
+# first — otherwise a live album files the canonical recording under "…: World Tour Live". Demoted
+# rather than skipped: these releases still carry genuinely unique songs (a live-only medley, a
+# remix that never had a studio cut), and those still become wants once the originals have claimed
+# what they cover. This is a rank, so a live album that is the ONLY source of a song still wins it.
+RANK_DERIVATIVE = 4
+DERIVATIVE_SECONDARY = frozenset({"live", "remix", "demo", "dj-mix", "mixtape/street"})
 
 
 def release_order(items):
@@ -48,8 +55,14 @@ def release_order(items):
     """
     kind = next((t.get("release_type") for t in items if t.get("release_type")), None)
     secondary = {str(s).lower() for t in items for s in (t.get("release_secondary") or [])}
-    rank = RANK_COMPILATION if "compilation" in secondary else \
-        RELEASE_RANK.get(str(kind).lower(), RANK_UNKNOWN)
+    if "compilation" in secondary:
+        rank = RANK_COMPILATION
+    else:
+        rank = RELEASE_RANK.get(str(kind).lower(), RANK_UNKNOWN)
+        # max(), never a flat assignment: an "unreleased" recording that happens to be a live take
+        # must not be promoted to rank 4 and allowed to outrank a single.
+        if secondary & DERIVATIVE_SECONDARY:
+            rank = max(rank, RANK_DERIVATIVE)
     year = next((t.get("year") for t in items if t.get("year")), None)
     title = next((t.get("release_title") for t in items if t.get("release_title")), "") or ""
     return rank, (year or "9999"), title.lower()

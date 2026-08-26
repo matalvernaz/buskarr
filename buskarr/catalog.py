@@ -24,6 +24,7 @@ answer. A catalogue outage must not make the app unusable when manual entry woul
 import collections
 import concurrent.futures
 import json
+import os
 import threading
 import time
 import urllib.error
@@ -43,11 +44,34 @@ MB_RETRY_CODES = {502, 503, 504}
 MB_RETRIES = 4
 MB_BACKOFF = 2.0
 # Paging caps. Reaching one means the discography is INCOMPLETE and the caller is told so.
-MB_MAX_RECORDINGS = 1000
-MB_MAX_RELEASES = 500
+#
+# These are a runaway guard, not a budget. Set at 500/1000 they silently became the latter: Taylor
+# Swift has 2436 MusicBrainz releases and 2856 recordings, so a release walk stopped at 20% of the
+# discography and a recording walk at 35%. The releases that fit were whichever the browse returned
+# first — demos, promos and karaoke discs — while every album from 2013 on arrived through the
+# recording pass instead, which carries no release title, so 256 of 569 wants had no album at all.
+# One page is ~1.1 s, and a heavy-``inc`` release page returns ~59 rows, so the worst artist in the
+# catalogue costs roughly 45 s of release paging plus 30 s of recording paging inside the job
+# thread. That is affordable; a 20%-complete discography is not.
+MB_MAX_RECORDINGS = int(os.environ.get("MB_MAX_RECORDINGS", "5000"))
+MB_MAX_RELEASES = int(os.environ.get("MB_MAX_RELEASES", "4000"))
 DEEZER_PAGE = 200          # what one request may return; the endpoint pages past it via "next"
-DEEZER_MAX_RELEASES = 500  # absolute cap, matching MusicBrainz's
+DEEZER_MAX_RELEASES = int(os.environ.get("DEEZER_MAX_RELEASES", "2000"))
 ITUNES_MAX_SONGS = 200
+
+# Which MusicBrainz release statuses count as this artist's catalogue. MusicBrainz indexes far more
+# than what was released to listeners: of the first 100 Taylor Swift releases, 28 are Official and
+# the other 48 are Promotion, Withdrawn or Bootleg — the "2004 Demo CD", "Big Machine Records Promo
+# 2006" and radio-special discs that filled the library while 1989 and folklore were missing. A
+# release with no status at all is kept: absent is not the same as rejected.
+MB_STATUSES = frozenset(
+    s.strip().lower() for s in os.environ.get("MB_STATUSES", "official").split(",") if s.strip())
+
+# Release-group secondary types that are not music. These carry unique titles ("Generic Interview",
+# "Taylor Swift Interview"), so ranking them last does not help — nothing else ever claims those
+# titles and they become wants regardless. They have to be skipped outright.
+MB_SKIP_SECONDARY = frozenset({"interview", "spokenword", "audiobook", "audio drama",
+                               "field recording"})
 # Deezer has no per-release bulk endpoint, so a discography costs one request per release — 47 of
 # them for a mid-sized artist, which took 14.9 s sequentially and dominated the whole add. Deezer
 # tolerates roughly 50 requests per 5 s per IP, so 8 in flight is comfortably inside that while
@@ -352,6 +376,15 @@ class MusicBrainz:
             "releases", "release-count", MB_MAX_RELEASES)
         for rel in releases:
             group = rel.get("release-group") or {}
+            # Not everything MusicBrainz indexes was released to listeners, and not everything it
+            # indexes is music. Both filters run before the tracklist is read, so a skipped release
+            # also leaves its titles unattributed — the recording pass may still supply the song if
+            # it genuinely exists nowhere else.
+            status = (rel.get("status") or "").strip().lower()
+            if status and status not in MB_STATUSES:
+                continue
+            if {str(s).lower() for s in (group.get("secondary-types") or [])} & MB_SKIP_SECONDARY:
+                continue
             year = (rel.get("date") or group.get("first-release-date") or "")[:4]
             # One counter across every medium, not the track's own position: a two-disc release
             # numbers both discs from 1, and this library files an album into one flat directory.
@@ -362,6 +395,14 @@ class MusicBrainz:
                     rec = tr.get("recording") or {}
                     title = tr.get("title") or rec.get("title")
                     if not title:
+                        continue
+                    # A video recording is a separate entity from the audio one, so skipping it
+                    # loses no song: MusicBrainz carries “Tim McGraw” and “Tim McGraw” Video as
+                    # two recordings, and only the second is flagged. Left in, the video's want was
+                    # satisfied by the audio twin — same title, same length, so the duration gate
+                    # had nothing to object to — and the library got the same song twice under two
+                    # names. 36 of the first 470 Taylor Swift tracks are video.
+                    if rec.get("video"):
                         continue
                     # The track's own credit is what the release prints; the recording's is the
                     # canonical one. Prefer the release, since that is what the listener sees.
@@ -389,6 +430,11 @@ class MusicBrainz:
             # Already claimed by a release. Skipped on title alone deliberately: "everything by X"
             # means every song, not every take of every song — the same rule add_artist applies.
             if not title or db.strict_norm(title) in attributed:
+                continue
+            # Same rule as the release pass. Here it is what stops the video-only entries — "A Look
+            # Behind the Curtain", "“Teardrops on My Guitar” Video Behind the Scenes" — which sit on
+            # no audio release and so reach this fallback with nothing to deduplicate them against.
+            if r.get("video"):
                 continue
             date = (r.get("first-release-date") or "")[:4]
             tracks.append({

@@ -31,7 +31,12 @@ services:
       QBIT_URL: ""
       # ---- behaviour ----
       INTERVAL: "1800"
-      PER_CYCLE: "25"
+      # 25 was a two-day drain for one big artist: a Taylor Swift add queues several
+      # hundred wants and this is the only thing that decides how fast they land. A cycle
+      # averages ~15 s per want (Tidal hits are ~6 s, a YouTube fallback ~90 s), so 60
+      # fills about half the interval and leaves room for harvest and grabs. Overshooting
+      # is self-correcting — a provider throttle ends the cycle early with no strike.
+      PER_CYCLE: "60"
       # Where completed downloads land (slskd, torrent client) for harvesting.
       DOWNLOAD_DIRS: "/downloads/complete"
       # tiddl rewrites its token under $HOME, so HOME must persist across restarts.

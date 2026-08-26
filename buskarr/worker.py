@@ -14,7 +14,9 @@ import threading
 import time
 
 from mutagen.flac import FLAC
+from mutagen.id3 import ID3, ID3NoHeaderError, TALB, TDRC, TIT2, TPE1, TPE2, TRCK
 from mutagen.mp4 import MP4
+from mutagen.oggopus import OggOpus
 
 from . import bulk, credit, db, grab, match, providers
 
@@ -254,13 +256,27 @@ def tag(path, want, track=None):
 
     ``track`` resolves exactly as in ``destination`` — the want's own number first — so the
     filename and the embedded tag never disagree.
+
+    A track number is written only where it means "position on THIS album", matching
+    ``destination``'s rule exactly. An album-less want files into "Singles", which is a bucket and
+    not a release, and stamping every song in it "01" made one broken-looking album out of the lot —
+    the same defect the filename side already avoided, left in the tag because the old default was
+    ``int(track or 1)``.
+
+    ``.mp3`` and ``.opus`` are handled because harvest imports whatever the indexer served
+    (``harvest.py`` places and then calls this), and those two fell through to the ``return False``
+    below — a grabbed release landed in the library with no tags at all. ``.opus`` needs ``OggOpus``
+    specifically: ``OggVorbis`` rejects it with "no appropriate stream found", which is the same trap
+    that left 18 files unrepairable in ``repair.py``.
     """
     track = want_track(want, track)
     ext = os.path.splitext(path)[1].lower()
     lead = folder_artist(want)
+    numbered = bool(want["album"]) and bool(track)
     try:
-        if ext == ".flac":
-            m = FLAC(path)
+        if ext in (".flac", ".opus"):
+            # One Vorbis-comment key space, two container classes.
+            m = FLAC(path) if ext == ".flac" else OggOpus(path)
             m["title"], m["artist"] = [want["title"]], [want["artist"]]
             m["albumartist"] = [lead]
             # No album tag when the source had no album. Falling back to the song title wrote a
@@ -270,7 +286,10 @@ def tag(path, want, track=None):
                 m["album"] = [want["album"]]
             if want["year"]:
                 m["date"] = [str(want["year"])]
-            m["tracknumber"] = [str(int(track or 1))]
+            if numbered:
+                m["tracknumber"] = [str(int(track))]
+            else:
+                m.pop("tracknumber", None)
         elif ext in (".m4a", ".mp4"):
             m = MP4(path)
             m["\xa9nam"], m["\xa9ART"] = [want["title"]], [want["artist"]]
@@ -279,7 +298,29 @@ def tag(path, want, track=None):
                 m["\xa9alb"] = [want["album"]]
             if want["year"]:
                 m["\xa9day"] = [str(want["year"])]
-            m["trkn"] = [(int(track or 1), 0)]
+            if numbered:
+                m["trkn"] = [(int(track), 0)]
+            else:
+                m.pop("trkn", None)
+        elif ext == ".mp3":
+            try:
+                m = ID3(path)
+            except ID3NoHeaderError:
+                # A stripped MP3 has no tag block to load; save() writes one.
+                m = ID3()
+            m.setall("TIT2", [TIT2(encoding=3, text=[want["title"]])])
+            m.setall("TPE1", [TPE1(encoding=3, text=[want["artist"]])])
+            m.setall("TPE2", [TPE2(encoding=3, text=[lead])])
+            if want["album"]:
+                m.setall("TALB", [TALB(encoding=3, text=[want["album"]])])
+            if want["year"]:
+                m.setall("TDRC", [TDRC(encoding=3, text=[str(want["year"])])])
+            if numbered:
+                m.setall("TRCK", [TRCK(encoding=3, text=[str(int(track))])])
+            else:
+                m.delall("TRCK")
+            m.save(path)
+            return True
         else:
             return False
         m.save()
