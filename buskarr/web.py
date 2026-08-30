@@ -17,12 +17,18 @@ import urllib.request
 from fastapi import FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
-from . import bulk, catalog, db, match, providers, worker
+from . import api, bulk, catalog, db, match, providers, worker
 
 LIBRARY = os.environ.get("LIBRARY_DIR", "/music")
 DEEZER = "https://api.deezer.com"
 NUDGE = os.environ.get("NUDGE_FILE", "/state/nudge")
 app = FastAPI(title="buskarr")
+# The JSON API is a second door, for a companion service asking on somebody's
+# behalf rather than a person at a browser. It is mounted only when a key has
+# been chosen: an API that mutates the library must not be reachable merely
+# because the package was installed.
+if api.API_KEY:
+    app.include_router(api.router)
 # One-time schema init for this process; requests then open plain connections. Running the full
 # init — schema DDL, a BEGIN IMMEDIATE migration, two backfills — on every request took the
 # database's only write lock per page load, for work that can only ever act once per deploy.

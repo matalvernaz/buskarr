@@ -29,6 +29,13 @@ services:
       PROWLARR_URL: ""
       PROWLARR_API_KEY: "${PROWLARR_API_KEY:-}"
       QBIT_URL: ""
+      # ---- JSON API (optional) ----
+      # A second door, for a companion service adding music on somebody's
+      # behalf. UNSET MEANS OFF: the routes are not mounted at all, which is
+      # the only safe default for a mutation API in a package other people
+      # deploy. Set it to a long random string and give the same value to the
+      # caller.
+      BUSKARR_API_KEY: "${BUSKARR_API_KEY:-}"
       # ---- behaviour ----
       INTERVAL: "1800"
       # 25 was a two-day drain for one big artist: a Taylor Swift add queues several
