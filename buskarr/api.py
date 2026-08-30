@@ -16,6 +16,13 @@ holding a request open for the five minutes the walk takes.
 
 Vocabulary stays buskarr's: things are *added* and then *wanted*. A caller
 that calls them requests can say so at its own edge.
+
+Each route is a thin wrapper over a plain function of the same name. Calling a
+FastAPI route directly leaves its ``Body`` and ``Query`` defaults unresolved --
+they arrive as marker objects, not as the values they declare -- so the split
+is what makes the logic callable from a test without an HTTP stack. Starlette's
+test client needs ``httpx``, which this image does not carry and which would be
+a dependency for the whole service bought for a test.
 """
 import os
 import secrets
@@ -58,9 +65,13 @@ def _nudge() -> bool:
 
 
 @router.get("/capabilities")
-def capabilities(x_api_key: str | None = Header(default=None)) -> dict:
+def capabilities_route(x_api_key: str | None = Header(default=None)) -> dict:
+    return capabilities(x_api_key)
+
+
+def capabilities(key: str | None) -> dict:
     """What this buskarr can be asked for."""
-    _authorise(x_api_key)
+    _authorise(key)
     return {
         "version": API_VERSION,
         "units": list(UNITS),
@@ -69,16 +80,21 @@ def capabilities(x_api_key: str | None = Header(default=None)) -> dict:
 
 
 @router.get("/search")
-def search(q: str = Query(""), unit: str = Query("track"),
-           limit: int = Query(20, ge=1, le=50),
-           x_api_key: str | None = Header(default=None)) -> dict:
+def search_route(q: str = Query(""), unit: str = Query("track"),
+                 limit: int = Query(20, ge=1, le=50),
+                 x_api_key: str | None = Header(default=None)) -> dict:
+    return search(q, unit, limit, x_api_key)
+
+
+def search(q: str = "", unit: str = "track", limit: int = 20,
+           key: str | None = None) -> dict:
     """Catalogue search for one kind of thing.
 
     One unit per call rather than all three at once. The HTML page fans out
     because a person typing a name usually has not decided which of the three
     they meant; a caller that asked for albums has decided.
     """
-    _authorise(x_api_key)
+    _authorise(key)
     if unit not in UNITS:
         raise HTTPException(status_code=400, detail=f"unit must be one of {UNITS}")
     query = q.strip()
@@ -145,23 +161,31 @@ def _track_row(row: dict) -> dict:
 
 
 @router.post("/add")
-def add(unit: str = Body(..., embed=True),
-        ref: str = Body("", embed=True),
-        source: str = Body("deezer", embed=True),
-        artist: str = Body("", embed=True),
-        title: str = Body("", embed=True),
-        album: str = Body("", embed=True),
-        year: str = Body("", embed=True),
-        duration: float | None = Body(None, embed=True),
-        requested_by: str = Body("", embed=True, alias="requestedBy"),
-        x_api_key: str | None = Header(default=None)) -> dict:
+def add_route(unit: str = Body(..., embed=True),
+              ref: str = Body("", embed=True),
+              source: str = Body("deezer", embed=True),
+              artist: str = Body("", embed=True),
+              title: str = Body("", embed=True),
+              album: str = Body("", embed=True),
+              year: str = Body("", embed=True),
+              duration: float | None = Body(None, embed=True),
+              requested_by: str = Body("", embed=True, alias="requestedBy"),
+              x_api_key: str | None = Header(default=None)) -> dict:
+    return add(unit, ref, source, artist, title, album, year, duration,
+               requested_by, x_api_key)
+
+
+def add(unit: str, ref: str = "", source: str = "deezer", artist: str = "",
+        title: str = "", album: str = "", year: str = "",
+        duration: float | None = None, requested_by: str = "",
+        key: str | None = None) -> dict:
     """Add one artist, album or track.
 
-    Returns a `reference` the caller keeps and hands back to `/state`. It is
+    Returns a `reference` the caller keeps and hands back to `state`. It is
     not a want id for the bulk units: an artist add produces hundreds of wants
     and the thing that has a single state is the job that creates them.
     """
-    _authorise(x_api_key)
+    _authorise(key)
     if unit not in UNITS:
         raise HTTPException(status_code=400, detail=f"unit must be one of {UNITS}")
 
@@ -198,15 +222,19 @@ def add(unit: str = Body(..., embed=True),
 
 
 @router.get("/state")
-def state(reference: str = Query(...),
-          x_api_key: str | None = Header(default=None)) -> dict:
+def state_route(reference: str = Query(...),
+                x_api_key: str | None = Header(default=None)) -> dict:
+    return state(reference, x_api_key)
+
+
+def state(reference: str, key: str | None = None) -> dict:
     """How far along one add is.
 
     `have` and `total` are tracks, for every unit. A single track is one of
     one, which means a caller can report progress the same way whatever was
     asked for.
     """
-    _authorise(x_api_key)
+    _authorise(key)
     kind, _, ident = reference.partition(":")
     conn = db.connect()
     try:
@@ -270,15 +298,19 @@ def _job_state(conn, ident: str) -> dict:
 
 
 @router.post("/cancel")
-def cancel(reference: str = Body(..., embed=True),
-           x_api_key: str | None = Header(default=None)) -> dict:
+def cancel_route(reference: str = Body(..., embed=True),
+                 x_api_key: str | None = Header(default=None)) -> dict:
+    return cancel(reference, x_api_key)
+
+
+def cancel(reference: str, key: str | None = None) -> dict:
     """Stop looking for something. Never removes audio already on disk.
 
     A batch cancel keeps rows the worker has already satisfied and rows it is
     part-way through -- `db.cancel_batch` deletes only what is still pending,
     which is what makes this safe to call while a cycle is running.
     """
-    _authorise(x_api_key)
+    _authorise(key)
     kind, _, ident = reference.partition(":")
     conn = db.connect()
     try:
