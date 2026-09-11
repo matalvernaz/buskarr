@@ -162,7 +162,10 @@ def sweep(conn, dry_run=True, artist=None, drop_wants=False, log=log):
         log(f"  keep {os.path.relpath(keep, LIBRARY)}")
         keeper_want = conn.execute("SELECT id FROM wants WHERE file_path=?", (keep,)).fetchone()
         for lp in losers:
-            w = conn.execute("SELECT id, title FROM wants WHERE file_path=?", (lp,)).fetchone()
+            # Every want naming this file. `fetchone` left any sibling claimant pointing into
+            # the quarantine directory once the file moved there.
+            claimants = conn.execute(
+                "SELECT id, title FROM wants WHERE file_path=?", (lp,)).fetchall()
             log(f"      {'would quarantine' if dry_run else 'quarantining'} "
                 f"{os.path.relpath(lp, LIBRARY)}")
             if dry_run:
@@ -176,16 +179,17 @@ def sweep(conn, dry_run=True, artist=None, drop_wants=False, log=log):
             db.log_event(conn, "quarantined", lp,
                          f"identical decoded audio to {keep} -> {final}", commit=False)
             quarantined += 1
-            if w and drop_wants and keeper_want and w["id"] != keeper_want["id"]:
-                # The version this want names does not exist separately anywhere buskarr can
-                # reach, so leaving the row would re-fetch the same master forever.
-                conn.execute("DELETE FROM wants WHERE id=?", (w["id"],))
-                dropped += 1
-            elif w:
-                conn.execute("UPDATE wants SET file_path=?, note=? WHERE id=?",
-                             (keep, "duplicate audio quarantined; sharing the kept copy",
-                              w["id"]))
-                repointed += 1
+            for w in claimants:
+                if drop_wants and keeper_want and w["id"] != keeper_want["id"]:
+                    # The version this want names does not exist separately anywhere buskarr can
+                    # reach, so leaving the row would re-fetch the same master forever.
+                    conn.execute("DELETE FROM wants WHERE id=?", (w["id"],))
+                    dropped += 1
+                else:
+                    conn.execute("UPDATE wants SET file_path=?, note=? WHERE id=?",
+                                 (keep, "duplicate audio quarantined; sharing the kept copy",
+                                  w["id"]))
+                    repointed += 1
             conn.commit()
     if not dry_run:
         db.log_event(conn, "dupes", artist,
