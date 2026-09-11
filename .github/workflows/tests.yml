@@ -16,7 +16,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install mutagen
+      # The whole requirements file, not the one package the tests used to
+      # need. `tests/test_api.py` imports fastapi, so from the commit that
+      # added it every run has failed on an import -- which means the suite has
+      # reported red for reasons that say nothing about the code under review,
+      # and a genuine failure would have looked exactly the same.
+      - run: pip install -r requirements.txt
       - name: run test scripts
         run: |
           rc=0
