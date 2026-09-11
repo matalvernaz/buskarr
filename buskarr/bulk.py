@@ -47,6 +47,29 @@ RANK_COMPILATION = 5
 RANK_DERIVATIVE = 4
 DERIVATIVE_SECONDARY = frozenset({"live", "remix", "demo", "dj-mix", "mixtape/street"})
 
+# The folder a compilation's tracks share. Every other release files under its performer, which for
+# a compilation is a different act per track — fifteen tracks become fifteen one-track albums in
+# fifteen directories, because both the directory and the albumartist tag come from the credit.
+# One name for all of them is what makes the release one album again.
+VARIOUS_ARTISTS = "Various Artists"
+# Catalogue spellings of "nobody in particular". Compared case-folded and whole, not normalised:
+# db.norm strips to [a-z0-9] and would fold unrelated credits together.
+_VARIOUS_CREDITS = frozenset({
+    "various artists", "various", "various artist", "va", "v.a.", "v/a",
+    "varios artistas", "vários artistas", "verschiedene interpreten",
+    "artistes divers", "artistes variés", "vari artisti", "diverse artiesten",
+})
+
+
+def various_artists(album_artist):
+    """Is this release credited to nobody in particular?
+
+    Only the release's own credit answers this. A tracklist whose performers all differ is *not*
+    the test — a split single, a DJ mix and a duets record all look like that and each has a real
+    act to file under.
+    """
+    return (album_artist or "").strip().casefold() in _VARIOUS_CREDITS
+
 
 def release_order(items):
     """Sort key for one release's tracks: (preference rank, year, title).
@@ -123,7 +146,8 @@ def _get(url):
 
 
 def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer",
-              listing=None, attribution=None, enrich=None, enrich_track=None):
+              listing=None, attribution=None, enrich=None, enrich_track=None,
+              album_artist=None):
     """Add every track of an album as an individual want, in one transaction.
 
     Fetched first, written second. Committing per track let the worker claim rows mid-add, past the
@@ -144,10 +168,23 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
     only). Without this, an already-pending want acquired later was numbered from whatever release
     the provider served \u2014 the completed directory then held the source release's number, not this
     album's.
+
+    ``album_artist`` is the release's own credit. It is read for one question \u2014 is this a
+    compilation \u2014 and a caller passing its own ``listing`` must pass this too, or the release it
+    already fetched is queued as if it were credited to somebody.
     """
-    title, year, tracks = listing if listing else album_tracks(album_id, source)
+    if listing:
+        title, year, tracks = listing
+    else:
+        detail = album_detail(album_id, source)
+        title, year, tracks = detail["title"], detail["year"], detail["tracks"]
+        if album_artist is None:
+            album_artist = detail["artist"]
     if attribution:
         title, year = attribution
+    # A compilation's tracks share a folder and an albumartist; everything else keeps filing under
+    # its own performer, which is what the None falls back to in add_want.
+    lead = VARIOUS_ARTISTS if various_artists(album_artist) else None
     if not tracks:
         return {"album": title, "year": year, "added": 0, "already": 0, "existing": 0,
                 "total": 0, "batch": None, "source": source, "enriched": 0}
@@ -163,7 +200,7 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
             # that want (created=False), so the enrichment and counting below cover it.
             wid, created = db.add_want(conn, t["artist"], t["title"], title, year,
                                        t["duration"], requested_by, allow_dup=allow_dup,
-                                       batch=batch, batch_label=label,
+                                       batch=batch, batch_label=label, artist_lead=lead,
                                        track_no=t.get("track_no"), commit=False)
             if not created and db.enrich_want(conn, wid, title, year,
                                               track_no=t.get("track_no"), commit=False):
@@ -393,6 +430,7 @@ def complete_album(conn, want_id, requested_by=None):
         return {"outcome": "single", "resolved": detail["title"], "source": source}
     r = add_album(conn, ref, requested_by, source=source,
                   listing=(detail["title"], detail["year"], tracks),
+                  album_artist=detail.get("artist"),
                   attribution=attribution, enrich=want_id, enrich_track=seed_track)
     r.update({"outcome": "completed" if r["added"] else "already",
               "resolved": detail["title"],
