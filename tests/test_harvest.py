@@ -200,5 +200,49 @@ with tempfile.TemporaryDirectory() as d:
     finally:
         harvest.DOWNLOAD_DIRS, worker.LIBRARY, scan.probe, worker.tag = old
 
+print("\n=== a different recording under the same name is not adopted ===")
+# A want killed before its status was written owns its file without saying so, so
+# "no other want claims this path" alone would let the next want that computes the
+# same name take somebody else's audio. Duration is what separates them.
+with tempfile.TemporaryDirectory() as d:
+    lib = os.path.join(d, "lib")
+    downloads = os.path.join(d, "downloads", "Some Album [FLAC]")
+    os.makedirs(lib)
+    os.makedirs(downloads)
+    with open(os.path.join(downloads, "03 - Song.flac"), "w") as fh:
+        fh.write("AUDIO BYTES")
+
+    conn = db.init(os.path.join(d, "t.db"))
+    wid, _ = db.add_want(conn, "Arrogant Worms", "Song", "Live Bait", "2003", duration=100.0)
+
+    old = (harvest.DOWNLOAD_DIRS, worker.LIBRARY, scan.probe, worker.tag)
+    harvest.DOWNLOAD_DIRS = [os.path.dirname(downloads)]
+    worker.LIBRARY = lib
+    dest = os.path.join(lib, "Arrogant Worms", "Live Bait (2003)", "03 - Song.flac")
+
+    def probe_by_path(path):
+        base = {"tag_title": "Song", "tag_artist": "Arrogant Worms", "tag_album": None,
+                "tag_album_artist": "Arrogant Worms", "tag_year": None, "tag_track": 3,
+                "codec": "flac", "bitrate": 900000, "sample_rate": 44100, "bit_depth": 16}
+        # The file already at the destination is a nine-minute recording; the download
+        # in hand is the hundred-second one the want asked for.
+        return {**base, "duration": 540.0} if path == dest else {**base, "duration": 100.0}
+
+    scan.probe = probe_by_path
+    worker.tag = lambda path, want, track=None: True
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w") as fh:
+            fh.write("A DIFFERENT RECORDING")
+
+        harvest.harvest(conn, dry_run=False, log=lambda m: None)
+        check("the other recording was not overwritten",
+              open(dest).read() == "A DIFFERENT RECORDING")
+        row = conn.execute("SELECT status FROM wants WHERE id=?", (wid,)).fetchone()
+        check("and the want was not satisfied by it",
+              row["status"] != db.STATUS_HAVE, row["status"])
+    finally:
+        harvest.DOWNLOAD_DIRS, worker.LIBRARY, scan.probe, worker.tag = old
+
 print(f"\n{bad} failure(s)")
 sys.exit(1 if bad else 0)

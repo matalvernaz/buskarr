@@ -62,18 +62,32 @@ def candidate_files(root):
             yield os.path.join(dirpath, fn), candidate_guesses(fn)
 
 
-def _dest_belongs_to(conn, dest, want_id):
+def _dest_belongs_to(conn, dest, want_id, source_duration=None):
     """Whether an existing library file at ``dest`` is this want's to finish.
 
-    It is, unless some other want has already recorded that exact path as its own.
-    ``destination`` derives the name from the want's artist, album and track, so a
+    Two things have to hold. No other want may already have recorded that exact path
+    as its own -- ``destination`` derives the name from artist, album and track, so a
     collision means two wants really are claiming one name and the older claim keeps
-    it -- overwriting there is the thing ``copy_no_replace`` exists to prevent.
+    it. And the file that is there has to be the recording this want is resuming.
+
+    The second check is the one that is easy to leave out. A want killed before its
+    status was written owns its file without saying so, so "nobody claims it" alone
+    would let the next want that happens to compute the same name adopt somebody
+    else's audio. Duration decides it: a resumed file is a copy of the download in
+    hand and agrees, a different recording under the same name does not. A file that
+    cannot be probed is not adopted, because the safe answer to "is this mine" is no.
     """
     row = conn.execute(
         "SELECT id FROM wants WHERE file_path=? AND id<>? LIMIT 1", (dest, want_id)
     ).fetchone()
-    return row is None
+    if row is not None:
+        return False
+    if source_duration is None:
+        return True
+    there = scan.probe(dest)
+    if not there or not there.get("duration"):
+        return False
+    return match.duration_ok(source_duration, there["duration"])
 
 
 def harvest(conn, dry_run=True, limit=0, log=log):
@@ -151,7 +165,7 @@ def harvest(conn, dry_run=True, limit=0, log=log):
         # check. Three of those states were reproduced. Finishing the remaining steps is
         # safe because each is idempotent, and it is the only path that recovers them.
         resuming = os.path.exists(dest)
-        if resuming and not _dest_belongs_to(conn, dest, wid):
+        if resuming and not _dest_belongs_to(conn, dest, wid, info.get("duration")):
             log(f"    skipping {os.path.basename(dest)[:46]} — another want already holds that name")
             continue
         # Only meaningful for a name nothing has claimed: when resuming, the duplicate
