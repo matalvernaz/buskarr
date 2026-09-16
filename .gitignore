@@ -6,3 +6,4 @@ state/
 compose.yaml
 __pycache__/
 *.pyc
+.venv/

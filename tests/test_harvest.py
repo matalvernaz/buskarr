@@ -97,5 +97,108 @@ with tempfile.TemporaryDirectory() as d:
     finally:
         harvest.DOWNLOAD_DIRS, worker.LIBRARY, scan.probe, worker.tag = old
 
+print("\n=== an interrupted harvest finishes instead of being skipped for ever ===")
+# The copy, the tag, the index and the want's status are four separate steps. A process
+# killed between any two of them left a complete playable file at the canonical name
+# with the want still pending, and every later harvest hit `if os.path.exists(dest)`
+# and gave up. Three of those states were reproduced by the audit; this covers them.
+for label, pre_tag, pre_index in [
+    ("killed after the copy, before tag/index/status", False, False),
+    ("killed after tagging, before index/status", True, False),
+    ("killed after indexing, before the want's status", True, True),
+]:
+    with tempfile.TemporaryDirectory() as d:
+        lib = os.path.join(d, "lib")
+        downloads = os.path.join(d, "downloads", "Some Album [FLAC]")
+        os.makedirs(lib)
+        os.makedirs(downloads)
+        with open(os.path.join(downloads, "03 - Song.flac"), "w") as fh:
+            fh.write("AUDIO BYTES")
+
+        conn = db.init(os.path.join(d, "t.db"))
+        wid, _ = db.add_want(conn, "Arrogant Worms", "Song", "Live Bait", "2003",
+                             duration=100.0)
+
+        old = (harvest.DOWNLOAD_DIRS, worker.LIBRARY, scan.probe, worker.tag)
+        tagged = []
+        harvest.DOWNLOAD_DIRS = [os.path.dirname(downloads)]
+        worker.LIBRARY = lib
+        scan.probe = lambda path: {
+            "tag_title": "Song", "tag_artist": "Arrogant Worms", "tag_album": None,
+            "tag_album_artist": "Arrogant Worms", "tag_year": None, "tag_track": 3,
+            "duration": 100.0, "codec": "flac",
+            "bitrate": 900000, "sample_rate": 44100, "bit_depth": 16}
+        worker.tag = lambda path, want, track=None: tagged.append((path, track)) or True
+        try:
+            # Reproduce the interrupted state: the file is published, the rest is not done.
+            dest = os.path.join(lib, "Arrogant Worms", "Live Bait (2003)", "03 - Song.flac")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w") as fh:
+                fh.write("AUDIO BYTES")
+            if pre_tag:
+                tagged.append((dest, 3))
+            if pre_index:
+                scan.index_file(conn, lib, dest)
+
+            r = harvest.harvest(conn, dry_run=False, log=lambda m: None)
+            row = conn.execute("SELECT status, provider, file_path FROM wants WHERE id=?",
+                               (wid,)).fetchone()
+            check(f"{label}: the want ends up satisfied",
+                  row["status"] == db.STATUS_HAVE, f"{label}: {row['status']}")
+            check(f"{label}: the want points at the published file",
+                  row["file_path"] == dest, str(row["file_path"]))
+            check(f"{label}: the file is in the library index",
+                  conn.execute("SELECT 1 FROM files WHERE path=?", (dest,)).fetchone() is not None)
+            check(f"{label}: the file was tagged for the want that asked",
+                  any(t[0] == dest for t in tagged), str(tagged))
+            check(f"{label}: nothing was copied over the published bytes",
+                  open(dest).read() == "AUDIO BYTES")
+            r2 = harvest.harvest(conn, dry_run=False, log=lambda m: None)
+            check(f"{label}: a further run does nothing", r2["imported"] == 0, str(r2))
+        finally:
+            harvest.DOWNLOAD_DIRS, worker.LIBRARY, scan.probe, worker.tag = old
+
+print("\n=== a name another want already holds is still never taken ===")
+with tempfile.TemporaryDirectory() as d:
+    lib = os.path.join(d, "lib")
+    downloads = os.path.join(d, "downloads", "Some Album [FLAC]")
+    os.makedirs(lib)
+    os.makedirs(downloads)
+    with open(os.path.join(downloads, "03 - Song.flac"), "w") as fh:
+        fh.write("AUDIO BYTES")
+
+    conn = db.init(os.path.join(d, "t.db"))
+    wid, _ = db.add_want(conn, "Arrogant Worms", "Song", "Live Bait", "2003", duration=100.0)
+    other, _ = db.add_want(conn, "Arrogant Worms", "Something Else", "Live Bait", "2003",
+                           duration=100.0)
+
+    old = (harvest.DOWNLOAD_DIRS, worker.LIBRARY, scan.probe, worker.tag)
+    harvest.DOWNLOAD_DIRS = [os.path.dirname(downloads)]
+    worker.LIBRARY = lib
+    scan.probe = lambda path: {
+        "tag_title": "Song", "tag_artist": "Arrogant Worms", "tag_album": None,
+        "tag_album_artist": "Arrogant Worms", "tag_year": None, "tag_track": 3,
+        "duration": 100.0, "codec": "flac",
+        "bitrate": 900000, "sample_rate": 44100, "bit_depth": 16}
+    worker.tag = lambda path, want, track=None: True
+    try:
+        dest = os.path.join(lib, "Arrogant Worms", "Live Bait (2003)", "03 - Song.flac")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w") as fh:
+            fh.write("SOMEBODY ELSE'S AUDIO")
+        # The other want already recorded that exact path as its own.
+        conn.execute("UPDATE wants SET file_path=?, status=? WHERE id=?",
+                     (dest, db.STATUS_HAVE, other))
+        conn.commit()
+
+        harvest.harvest(conn, dry_run=False, log=lambda m: None)
+        check("the other want's file was not overwritten",
+              open(dest).read() == "SOMEBODY ELSE'S AUDIO")
+        row = conn.execute("SELECT status FROM wants WHERE id=?", (wid,)).fetchone()
+        check("and this want was not falsely satisfied",
+              row["status"] != db.STATUS_HAVE, row["status"])
+    finally:
+        harvest.DOWNLOAD_DIRS, worker.LIBRARY, scan.probe, worker.tag = old
+
 print(f"\n{bad} failure(s)")
 sys.exit(1 if bad else 0)

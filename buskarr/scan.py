@@ -48,7 +48,12 @@ def _probe(path):
          # Both albumartist spellings: Vorbis/FLAC write ALBUMARTIST, MP4 and ID3 come through
          # as album_artist. Asking for only one silently reads empty on half the library.
          "format=bit_rate,duration:"
-         "format_tags=artist,album,title,date,track,album_artist,albumartist",
+         "format_tags=artist,album,title,date,track,album_artist,albumartist:"
+         # Opus, and Vorbis in Ogg, carry their comments on the audio STREAM rather
+         # than the container, so a correctly tagged file read every field as empty.
+         # Harvest then fell back to path evidence and rejected it at the artist gate:
+         # a finished, playable download stayed pending because nothing could name it.
+         "stream_tags=artist,album,title,date,track,album_artist,albumartist",
          "-of", "json", path],
         capture_output=True, text=True, timeout=PROBE_TIMEOUT)
     if r.returncode != 0:
@@ -59,7 +64,11 @@ def _probe(path):
         return None
     st = (d.get("streams") or [{}])[0]
     fm = d.get("format") or {}
-    tags = {k.lower(): v for k, v in (fm.get("tags") or {}).items()}
+    # Container first, stream only where the container is silent. That ordering keeps
+    # every format that already worked reading exactly as before -- FLAC, MP3 and MP4
+    # put their tags on the container -- and adds the ones that put them elsewhere.
+    tags = {k.lower(): v for k, v in (st.get("tags") or {}).items()}
+    tags.update({k.lower(): v for k, v in (fm.get("tags") or {}).items() if v})
 
     def as_int(v):
         try:
