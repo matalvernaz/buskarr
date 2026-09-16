@@ -672,6 +672,29 @@ def run_harvest(conn):
     return retired
 
 
+def due_wants(conn, now, limit):
+    """The wants this cycle should work, most deserving first.
+
+    UNAVAILABLE belongs here. `attempt` writes that status together with a
+    `retry_after` and a note saying it will be looked at again in N days, and
+    for a long time nothing read either: the selector asked for PENDING and
+    FAILED only, so the deadline passed and the want simply stopped existing as
+    far as the worker was concerned. The live database showed what that looks
+    like -- 268 unavailable wants, every one of them at exactly one strike.
+
+    The ordering keeps that from costing anything. Unavailable wants are the
+    oldest rows there are, so on `requested_at` alone a backlog would take every
+    slot of every cycle ahead of something asked for a minute ago. Sorting the
+    status flag first puts fresh work at the head and lets retries fill what is
+    left, which also means the backlog drains a cycle at a time rather than all
+    at once."""
+    return conn.execute(
+        "SELECT * FROM wants WHERE status IN (?,?,?) AND (retry_after IS NULL OR retry_after<?) "
+        "ORDER BY (status = ?), requested_at LIMIT ?",
+        (db.STATUS_PENDING, db.STATUS_FAILED, db.STATUS_UNAVAILABLE, now,
+         db.STATUS_UNAVAILABLE, limit)).fetchall()
+
+
 def cycle(conn):
     # Backstop only, and now actually conditional. Calling it unconditionally made this a SECOND
     # active runner: with more queued jobs than one claim batch, the thread and this loop both ran
@@ -729,10 +752,7 @@ def cycle(conn):
     conn.commit()
     if stale:
         log(f"{stale} queued-at-peer want(s) timed out; back to pending")
-    rows = conn.execute(
-        "SELECT * FROM wants WHERE status IN (?,?) AND (retry_after IS NULL OR retry_after<?) "
-        "ORDER BY requested_at LIMIT ?",
-        (db.STATUS_PENDING, db.STATUS_FAILED, now, PER_CYCLE)).fetchall()
+    rows = due_wants(conn, now, PER_CYCLE)
     if not rows:
         log("nothing pending")
         return 0

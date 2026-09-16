@@ -125,7 +125,12 @@ def refile(conn, artist=None, dry_run=True, log=print):
         # and the library disagrees with its own directory layout.
         worker.tag(final, w, (scan.probe(final) or {}).get("tag_track"))
         sidecars += _move_sidecars(old, final, log)
-        conn.execute("UPDATE wants SET file_path=? WHERE id=?", (final, w["id"]))
+        # Every want that named this file, not just the one being moved. Two wants legitimately
+        # share a path -- `find_recording` satisfies an edition-noise variant from the file a
+        # sibling want just placed, and that row carries no provider, so `plan` never selects it
+        # and it is only ever collateral. Re-pointing by id left it naming a path that no longer
+        # existed. Same rule, and the same reason, as fold's.
+        conn.execute("UPDATE wants SET file_path=? WHERE file_path=?", (final, old))
         conn.execute("DELETE FROM files WHERE path=?", (old,))
         conn.commit()
         _prune(os.path.dirname(old), LIBRARY)

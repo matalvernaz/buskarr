@@ -62,6 +62,20 @@ def candidate_files(root):
             yield os.path.join(dirpath, fn), candidate_guesses(fn)
 
 
+def _dest_belongs_to(conn, dest, want_id):
+    """Whether an existing library file at ``dest`` is this want's to finish.
+
+    It is, unless some other want has already recorded that exact path as its own.
+    ``destination`` derives the name from the want's artist, album and track, so a
+    collision means two wants really are claiming one name and the older claim keeps
+    it -- overwriting there is the thing ``copy_no_replace`` exists to prevent.
+    """
+    row = conn.execute(
+        "SELECT id FROM wants WHERE file_path=? AND id<>? LIMIT 1", (dest, want_id)
+    ).fetchone()
+    return row is None
+
+
 def harvest(conn, dry_run=True, limit=0, log=log):
     """Match wanted tracks against completed downloads and import the BEST copy of each.
 
@@ -129,26 +143,42 @@ def harvest(conn, dry_run=True, limit=0, log=log):
         others = len(copies) - 1
         ext = os.path.splitext(path)[1].lower()
         dest = worker.destination(w, ext, info.get("tag_track"))
-        if os.path.exists(dest):
+
+        # A destination that already exists used to end this want here, for ever. The
+        # steps after the copy -- tag, index, set the want to have -- are separate, so a
+        # process killed between them left a complete playable file at the canonical
+        # name with the want still pending, and every later harvest skipped it on this
+        # check. Three of those states were reproduced. Finishing the remaining steps is
+        # safe because each is idempotent, and it is the only path that recovers them.
+        resuming = os.path.exists(dest)
+        if resuming and not _dest_belongs_to(conn, dest, wid):
+            log(f"    skipping {os.path.basename(dest)[:46]} — another want already holds that name")
             continue
-        if not w["allow_dup"] and db.find_exact(conn, w["artist"], w["title"], w["duration"]):
+        # Only meaningful for a name nothing has claimed: when resuming, the duplicate
+        # this would find is the half-imported file itself.
+        if not resuming and not w["allow_dup"] and db.find_exact(conn, w["artist"], w["title"], w["duration"]):
             continue
         extra = f" (best of {len(copies)} copies)" if others else ""
-        log(f"    {'would import' if dry_run else 'importing'} {w['artist']} - {w['title']}"
+        verb = "would import" if dry_run else ("finishing" if resuming else "importing")
+        log(f"    {verb} {w['artist']} - {w['title']}"
             f"  <- {os.path.basename(path)[:44]} "
             f"({info['codec']} {int((info['bitrate'] or 0) / 1000)}k){extra}")
         imported += 1
         if not dry_run:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            # Copy, never move: the torrent client still needs the original in place to seed.
-            # And claim the name atomically — the exists-check above is only a cheap skip, not a
-            # guarantee. shutil.copy2 TRUNCATES an existing destination, so racing the worker's
-            # placement of the same want would have destroyed whichever file landed first.
-            try:
-                worker.copy_no_replace(path, dest)
-            except FileExistsError:
-                imported -= 1
-                continue
+            if not resuming:
+                # Copy, never move: the torrent client still needs the original in place to seed.
+                # And claim the name atomically — the exists-check above is only a cheap skip, not a
+                # guarantee. shutil.copy2 TRUNCATES an existing destination, so racing the worker's
+                # placement of the same want would have destroyed whichever file landed first.
+                try:
+                    worker.copy_no_replace(path, dest)
+                except FileExistsError:
+                    imported -= 1
+                    continue
+            # Retagging on resume matters rather than being belt-and-braces: a kill after
+            # the copy and before the tag leaves the source release's own album on the
+            # file, not the one that was asked for.
             worker.tag(dest, w, info.get("tag_track"))
             scan.index_file(conn, worker.LIBRARY, dest)
             conn.execute(

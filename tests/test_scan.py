@@ -106,5 +106,44 @@ with tempfile.TemporaryDirectory() as d:
     finally:
         scan.probe = old_probe
 
+print("\n=== tags are read wherever the container keeps them ===")
+# Opus, and Vorbis in Ogg, put their comments on the audio STREAM. probe() asked only
+# for format_tags, so a correctly tagged Opus download read as having no artist at all,
+# harvest fell back to path evidence and rejected it at the artist gate: a finished,
+# playable file stayed pending for ever.
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+
+if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+    with tempfile.TemporaryDirectory() as d:
+        made = {}
+        for name, args in [
+            ("opus", ["-c:a", "libopus"]),
+            ("flac", []),
+            ("mp3", []),
+        ]:
+            path = os.path.join(d, f"probe-case.{name}")
+            r = subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi",
+                 "-i", "sine=frequency=440:duration=2",
+                 "-metadata", "artist=Cobalt Ensemble",
+                 "-metadata", "title=Recovery Recording",
+                 "-metadata", "album=Requested Album", *args, path],
+                capture_output=True, text=True)
+            if r.returncode == 0:
+                made[name] = path
+
+        for name, path in made.items():
+            info = scan.probe(path)
+            check(f"{name}: artist read", info and info["tag_artist"] == "Cobalt Ensemble",
+                  repr(info and info["tag_artist"]))
+            check(f"{name}: title read", info and info["tag_title"] == "Recovery Recording",
+                  repr(info and info["tag_title"]))
+            check(f"{name}: album read", info and info["tag_album"] == "Requested Album",
+                  repr(info and info["tag_album"]))
+        check("all three containers were generated", len(made) == 3, str(sorted(made)))
+else:
+    print("  skip  ffmpeg/ffprobe not on PATH")
+
 print(f"\n{bad} failure(s)")
 sys.exit(1 if bad else 0)
