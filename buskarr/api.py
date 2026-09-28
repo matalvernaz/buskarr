@@ -140,16 +140,29 @@ def _search(unit: str, query: str, limit: int) -> list[dict]:
     return out[:limit]
 
 
+def _image(row: dict) -> str | None:
+    """The catalogue's picture of a hit -- a cover, or an artist's photograph.
+
+    https only: whatever this returns is loaded by somebody's phone or browser
+    straight from the catalogue. None where the source has no picture, which is
+    every MusicBrainz row -- it does not keep any.
+    """
+    url = row.get("image")
+    return url if isinstance(url, str) and url.startswith("https://") else None
+
+
 def _artist_row(row: dict) -> dict:
     return {"unit": "artist", "source": row.get("source"), "ref": row.get("ref"),
             "name": row.get("name") or "", "hint": row.get("hint") or "",
-            "releases": row.get("releases"), "listeners": row.get("listeners")}
+            "releases": row.get("releases"), "listeners": row.get("listeners"),
+            "imageUrl": _image(row)}
 
 
 def _album_row(row: dict) -> dict:
     return {"unit": "album", "source": row.get("source"), "ref": row.get("ref"),
             "title": row.get("title") or "", "artist": row.get("artist") or "",
-            "kind": row.get("kind"), "tracks": row.get("tracks")}
+            "kind": row.get("kind"), "tracks": row.get("tracks"),
+            "imageUrl": _image(row)}
 
 
 def _track_row(row: dict) -> dict:
@@ -157,7 +170,8 @@ def _track_row(row: dict) -> dict:
             "artist": row.get("artist") or "", "title": row.get("title") or "",
             "album": row.get("album") or "", "year": row.get("year"),
             "duration": row.get("duration"),
-            "sources": sorted(row.get("sources") or [])}
+            "sources": sorted(row.get("sources") or []),
+            "imageUrl": _image(row)}
 
 
 @router.post("/add")

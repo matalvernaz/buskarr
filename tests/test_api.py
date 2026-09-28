@@ -133,6 +133,22 @@ conn.close()
 check(api.cancel(reference=f"want:{want_id}", key=KEY)["removed"] is False,
       "a want already downloaded is not deleted by a cancel")
 
+# A hit's picture: passed on from the catalogue, https only, and absent rather
+# than invented for a source that keeps none.
+COVER = ("https://cdn-images.dzcdn.net/images/cover/"
+         "5718f7c81c27e0b2417e2a4c45224f8a/500x500-000000-80-0-0.jpg")
+check(api._album_row({"source": "deezer", "ref": "302127", "title": "Discovery",
+                      "image": COVER})["imageUrl"] == COVER,
+      "an album row carries the cover its catalogue published")
+check(api._track_row({"source": "deezer", "artist": "a", "title": "b",
+                      "image": COVER})["imageUrl"] == COVER,
+      "a track row carries its album's cover")
+check(api._artist_row({"source": "musicbrainz", "ref": "x",
+                       "name": "Daft Punk"})["imageUrl"] is None,
+      "an artist MusicBrainz found has no picture, and none is made up")
+check(api._album_row({"image": "http://cdn.example/x.jpg"})["imageUrl"] is None,
+      "a plain-http picture is not passed on")
+
 shutil.rmtree(_scratch, ignore_errors=True)
 
 for failure in failures:
