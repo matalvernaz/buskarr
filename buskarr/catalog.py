@@ -210,20 +210,25 @@ class Deezer:
                         # The release this track belongs to, usable with bulk.album_detail. The
                         # title alone cannot get back to the release — same-titled editions abound.
                         "album_ref": str((t.get("album") or {}).get("id") or "") or None,
-                        "year": None, "duration": float(t.get("duration") or 0) or None})
+                        "year": None, "duration": float(t.get("duration") or 0) or None,
+                        # The album's cover, for whoever shows the search result. Search
+                        # payloads carry it already, so it costs nothing to keep.
+                        "image": (t.get("album") or {}).get("cover_big")})
         return out
 
     def search_albums(self, q, limit=10):
         d = _get(f"{self.api}/search/album?q={urllib.parse.quote(q)}&limit={limit}")
         return [{"source": self.name, "ref": str(a["id"]), "title": a.get("title") or "",
                  "artist": (a.get("artist") or {}).get("name") or "",
-                 "kind": a.get("record_type"), "tracks": a.get("nb_tracks")}
+                 "kind": a.get("record_type"), "tracks": a.get("nb_tracks"),
+                 "image": a.get("cover_big")}
                 for a in d.get("data", []) if a.get("id")]
 
     def search_artists(self, q, limit=8):
         d = _get(f"{self.api}/search/artist?q={urllib.parse.quote(q)}&limit={limit}")
         return [{"source": self.name, "ref": str(a["id"]), "name": a.get("name") or "",
-                 "hint": "", "releases": a.get("nb_album"), "listeners": a.get("nb_fan")}
+                 "hint": "", "releases": a.get("nb_album"), "listeners": a.get("nb_fan"),
+                 "image": a.get("picture_big")}
                 for a in d.get("data", [])]
 
     def known_for(self, ref, n=3):
@@ -475,7 +480,8 @@ class ITunes:
                         "album": t.get("collectionName") or "",
                         "album_ref": str(t.get("collectionId") or "") or None,
                         "year": (t.get("releaseDate") or "")[:4] or None,
-                        "duration": (ms / 1000.0) if ms else None})
+                        "duration": (ms / 1000.0) if ms else None,
+                        "image": t.get("artworkUrl100")})
         return out
 
     def search_albums(self, q, limit=10):
@@ -486,7 +492,7 @@ class ITunes:
                  # Apple exposes no primary release type; a one-track collection is a single by
                  # definition and anything longer is left unknown rather than guessed at.
                  "kind": "single" if a.get("trackCount") == 1 else None,
-                 "tracks": a.get("trackCount")}
+                 "tracks": a.get("trackCount"), "image": a.get("artworkUrl100")}
                 for a in d.get("results", []) if a.get("collectionId")]
 
     def search_artists(self, q, limit=8):
@@ -594,7 +600,7 @@ def merge_tracks(results):
                 cur["sources"].append(t["source"])
             cur["rank"] = min(cur["rank"], i)
             # Keep whichever copy carries the most usable metadata.
-            for field in ("duration", "album", "year"):
+            for field in ("duration", "album", "year", "image"):
                 if not cur.get(field) and t.get(field):
                     cur[field] = t[field]
     # Relevance first; agreement across catalogues breaks ties in its favour.

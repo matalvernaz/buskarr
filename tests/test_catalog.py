@@ -84,5 +84,11 @@ m = merge(track("deezer", "Amanda McBroom", "The Rose", 197.0, album=None, year=
 check("the copy with more metadata fills the gaps",
       len(m) == 1 and m[0]["album"] == "Portraits" and m[0]["year"] == "1994")
 
+COVER = "https://is1-ssl.mzstatic.com/image/thumb/Music/x.jpg/100x100bb.jpg"
+m = merge(track("deezer", "Amanda McBroom", "The Rose", 197.0, image=None),
+          track("itunes", "Amanda McBroom", "The Rose", 197.0, image=COVER))
+check("a cover one catalogue has is kept when the other has none",
+      len(m) == 1 and m[0].get("image") == COVER, str(m[0].get("image")))
+
 print(f"\n{bad} failure(s)")
 sys.exit(1 if bad else 0)
