@@ -24,6 +24,10 @@ LIBRARY = os.environ.get("LIBRARY_DIR", "/music")
 STAGING = os.environ.get("STAGING_DIR", "/state/staging")
 INTERVAL = int(os.environ.get("INTERVAL", "1800"))
 PER_CYCLE = int(os.environ.get("PER_CYCLE", "25"))
+# The wait before the next cycle while new wants are still due. INTERVAL suits a queue that is
+# mostly empty, but with a backlog it added half an hour to every PER_CYCLE songs. A throttled
+# cycle, or one with no provider to ask, still waits the full INTERVAL.
+BUSY_INTERVAL = int(os.environ.get("BUSY_INTERVAL", "300"))
 BASE_COOLDOWN = int(os.environ.get("BASE_COOLDOWN", str(24 * 3600)))
 MAX_COOLDOWN = int(os.environ.get("MAX_COOLDOWN", str(30 * 24 * 3600)))
 # A search returning nothing is ambiguous — a throttled session looks identical to a song nobody
@@ -522,7 +526,8 @@ def run_jobs(conn):
         log(f"job {j['id']}: {j['kind']} {j['label'] or j['ref']} from {j['source']}")
         try:
             if j["kind"] == "album":
-                r = bulk.add_album(conn, j["ref"], j["requested_by"], source=j["source"])
+                r = bulk.add_album(conn, j["ref"], j["requested_by"], source=j["source"],
+                                   bulk=bool(j["bulk"]))
             elif j["kind"] == "complete":
                 r = bulk.complete_album(conn, int(j["ref"]), j["requested_by"])
             elif j["kind"] == "rescan":
@@ -531,7 +536,8 @@ def run_jobs(conn):
                 from . import scan
                 r = scan.scan(conn, LIBRARY, log=log)
             elif j["kind"] == "artist":
-                r = bulk.add_artist(conn, j["ref"], j["requested_by"], source=j["source"])
+                r = bulk.add_artist(conn, j["ref"], j["requested_by"], source=j["source"],
+                                    bulk=bool(j["bulk"]))
             else:
                 # Refused, never guessed at. The old fallthrough ran add_artist, so any future
                 # kind — or a job left queued across a version change — became a discography add
@@ -687,15 +693,52 @@ def due_wants(conn, now, limit):
     slot of every cycle ahead of something asked for a minute ago. Sorting the
     status flag first puts fresh work at the head and lets retries fill what is
     left, which also means the backlog drains a cycle at a time rather than all
-    at once."""
+    at once.
+
+    Within that, people take turns. By age alone, one person's imported list of
+    two thousand songs would fill every cycle for days while anybody else's ask
+    waited behind it. Each requester's wants are numbered oldest first, with
+    anything asked for one at a time ahead of anything that came in bulk, and a
+    cycle takes everyone's first, then everyone's second. Retries are numbered
+    apart from fresh work, so a person's old misses do not push their new ask
+    down the line."""
     return conn.execute(
-        "SELECT * FROM wants WHERE status IN (?,?,?) AND (retry_after IS NULL OR retry_after<?) "
-        "ORDER BY (status = ?), requested_at LIMIT ?",
-        (db.STATUS_PENDING, db.STATUS_FAILED, db.STATUS_UNAVAILABLE, now,
-         db.STATUS_UNAVAILABLE, limit)).fetchall()
+        "SELECT * FROM ("
+        " SELECT *, ROW_NUMBER() OVER ("
+        "   PARTITION BY COALESCE(requested_by, ''), (status = ?)"
+        "   ORDER BY bulk, requested_at, id) AS turn"
+        " FROM wants WHERE status IN (?,?,?) AND (retry_after IS NULL OR retry_after<?)) "
+        "ORDER BY (status = ?), turn, bulk, requested_at, id LIMIT ?",
+        (db.STATUS_UNAVAILABLE, db.STATUS_PENDING, db.STATUS_FAILED, db.STATUS_UNAVAILABLE,
+         now, db.STATUS_UNAVAILABLE, limit)).fetchall()
+
+
+def fresh_work_due(conn, now):
+    """Whether a want that has not yet missed is waiting for a cycle.
+
+    Retries do not count. They are on a backoff of days, and hurrying the next cycle for them
+    would only ask every provider again for songs none of them had.
+    """
+    return conn.execute(
+        "SELECT 1 FROM wants WHERE status IN (?,?) AND (retry_after IS NULL OR retry_after<?) "
+        "LIMIT 1", (db.STATUS_PENDING, db.STATUS_FAILED, now)).fetchone() is not None
+
+
+def next_wait(conn, held_back):
+    """How long to sleep after a cycle. ``held_back`` is a cycle that was throttled or failed."""
+    if not held_back and fresh_work_due(conn, time.time()):
+        return min(BUSY_INTERVAL, INTERVAL)
+    return INTERVAL
+
+
+#: Whether the last cycle stopped for a reason more cycles would not fix: a provider said we
+#: were going too fast, or there was no provider to ask. ``main`` reads it to choose the wait.
+_held_back = False
 
 
 def cycle(conn):
+    global _held_back
+    _held_back = False
     # Backstop only, and now actually conditional. Calling it unconditionally made this a SECOND
     # active runner: with more queued jobs than one claim batch, the thread and this loop both ran
     # adds and their BEGIN IMMEDIATE write phases contended, stalling the web process's enqueue.
@@ -727,6 +770,7 @@ def cycle(conn):
             log(f"provider {e['name']} DEGRADED: {e['detail']}")
     if not provs:
         log("no providers available — nothing to do")
+        _held_back = True
         return 0
     log(f"providers: {', '.join(e['name'] for e in provs)}")
     for e in provs:
@@ -766,6 +810,7 @@ def cycle(conn):
         except providers.RateLimited as e:
             log(f"!! throttled ({e}) — ending cycle early, no strike recorded")
             db.log_event(conn, "throttled", None, str(e))
+            _held_back = True
             break
         if outcome == "have":
             got += 1
@@ -825,12 +870,21 @@ def main():
     _job_thread = threading.Thread(target=job_loop, name="jobs", daemon=True)
     _job_thread.start()
     while True:
+        held_back = True
         try:
             cycle(conn)
+            held_back = _held_back
         except Exception as e:
             log(f"cycle error: {type(e).__name__}: {e}")
             db.log_event(conn, "error", None, f"{type(e).__name__}: {e}")
-        wait(INTERVAL)
+        try:
+            pause = next_wait(conn, held_back)
+        except Exception as e:
+            log(f"could not size the wait ({type(e).__name__}: {e}); waiting the full interval")
+            pause = INTERVAL
+        if pause < INTERVAL:
+            log(f"more is waiting; next cycle in {pause // 60} min")
+        wait(pause)
 
 
 if __name__ == "__main__":

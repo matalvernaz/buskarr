@@ -149,6 +149,40 @@ check(api._artist_row({"source": "musicbrainz", "ref": "x",
 check(api._album_row({"image": "http://cdn.example/x.jpg"})["imageUrl"] is None,
       "a plain-http picture is not passed on")
 
+# --- bulk adds and many states at once ---------------------------------------
+check(api.capabilities(key=KEY).get("batchState") is True,
+      "capabilities says states can be asked for in one call")
+check(api.capabilities(key=KEY).get("bulk") is True,
+      "and that an add can be marked bulk")
+
+single = api.add(unit="track", artist="Bulk Act", title="Asked Alone", key=KEY,
+                 requested_by="listener")
+imported = api.add(unit="track", artist="Bulk Act", title="From A List", key=KEY,
+                   requested_by="listener", bulk=True)
+conn = db.connect()
+marks = {row["title"]: row["bulk"] for row in conn.execute(
+    "SELECT title, bulk FROM wants WHERE artist='Bulk Act'")}
+check(marks == {"Asked Alone": 0, "From A List": 1},
+      f"a track added in bulk is stored as bulk and one added alone is not: {marks}")
+album = api.add(unit="album", ref="777", source="deezer", title="A Listed Album",
+                key=KEY, requested_by="listener", bulk=True)
+job_id = album["reference"].split(":", 1)[1]
+check(conn.execute("SELECT bulk FROM jobs WHERE id=?", (job_id,)).fetchone()["bulk"] == 1,
+      "an album added in bulk queues a bulk job")
+conn.close()
+
+answer = api.states(references=[single["reference"], imported["reference"],
+                                album["reference"], "want:99999999", "nonsense"],
+                    key=KEY)["states"]
+check(set(answer) == {single["reference"], imported["reference"], album["reference"]},
+      f"states answers for every reference it knows and leaves out the rest: {sorted(answer)}")
+check(answer[single["reference"]] == api.state(reference=single["reference"], key=KEY),
+      "each answer is what state would have said")
+check(status_of(api.states, references=["want:1"] * (api.MAX_STATES + 1), key=KEY) == 400,
+      "a call past the cap is refused rather than worked through")
+check(status_of(api.states, references=[], key=None) == 401,
+      "and states needs the key like everything else")
+
 shutil.rmtree(_scratch, ignore_errors=True)
 
 for failure in failures:

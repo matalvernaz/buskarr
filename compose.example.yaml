@@ -44,6 +44,9 @@ services:
       # fills about half the interval and leaves room for harvest and grabs. Overshooting
       # is self-correcting — a provider throttle ends the cycle early with no strike.
       PER_CYCLE: "60"
+      # The wait instead of INTERVAL while new wants are still due, so a long list is
+      # not held to sixty songs per half hour. A throttled cycle still waits INTERVAL.
+      BUSY_INTERVAL: "300"
       # Where completed downloads land (slskd, torrent client) for harvesting.
       DOWNLOAD_DIRS: "/downloads/complete"
       # tiddl rewrites its token under $HOME, so HOME must persist across restarts.
