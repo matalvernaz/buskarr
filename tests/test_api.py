@@ -215,6 +215,9 @@ check(called == list(api.catalog.DEFAULT_ORDER),
 check(status_of(api.search, q="x", unit="track", limit=5, key=KEY,
                 sources="nonsense") == 400,
       "a source that does not exist is refused rather than ignored")
+check(status_of(api.search, q="  ", unit="track", limit=5, key=KEY,
+                sources="nonsense") == 400,
+      "even when there is nothing to search for")
 api.catalog.get = real_get
 
 shutil.rmtree(_scratch, ignore_errors=True)

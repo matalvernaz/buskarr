@@ -106,14 +106,14 @@ def search(q: str = "", unit: str = "track", limit: int = 20,
     _authorise(key)
     if unit not in UNITS:
         raise HTTPException(status_code=400, detail=f"unit must be one of {UNITS}")
-    query = q.strip()
-    if not query:
-        return {"version": API_VERSION, "unit": unit, "query": "", "results": []}
     wanted = {name.strip() for name in sources.split(",") if name.strip()}
     unknown = wanted - set(catalog.DEFAULT_ORDER)
     if unknown:
         raise HTTPException(status_code=400,
                             detail=f"unknown source(s): {', '.join(sorted(unknown))}")
+    query = q.strip()
+    if not query:
+        return {"version": API_VERSION, "unit": unit, "query": "", "results": []}
     return {"version": API_VERSION, "unit": unit, "query": query,
             "results": _search(unit, query, limit, wanted)}
 
