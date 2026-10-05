@@ -85,29 +85,46 @@ def capabilities(key: str | None) -> dict:
 @router.get("/search")
 def search_route(q: str = Query(""), unit: str = Query("track"),
                  limit: int = Query(20, ge=1, le=50),
+                 sources: str = Query(""),
                  x_api_key: str | None = Header(default=None)) -> dict:
-    return search(q, unit, limit, x_api_key)
+    return search(q, unit, limit, x_api_key, sources)
 
 
 def search(q: str = "", unit: str = "track", limit: int = 20,
-           key: str | None = None) -> dict:
+           key: str | None = None, sources: str = "") -> dict:
     """Catalogue search for one kind of thing.
 
     One unit per call rather than all three at once. The HTML page fans out
     because a person typing a name usually has not decided which of the three
     they meant; a caller that asked for albums has decided.
+
+    `sources` narrows it to the named catalogues, comma separated, in their
+    usual order. A caller working through a long list asks the quick one first
+    and only goes to the rest when it found nothing certain: MusicBrainz is a
+    second or more a query and allows one a second.
     """
     _authorise(key)
     if unit not in UNITS:
         raise HTTPException(status_code=400, detail=f"unit must be one of {UNITS}")
+    wanted = {name.strip() for name in sources.split(",") if name.strip()}
+    unknown = wanted - set(catalog.DEFAULT_ORDER)
+    if unknown:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown source(s): {', '.join(sorted(unknown))}")
     query = q.strip()
     if not query:
         return {"version": API_VERSION, "unit": unit, "query": "", "results": []}
     return {"version": API_VERSION, "unit": unit, "query": query,
-            "results": _search(unit, query, limit)}
+            "results": _search(unit, query, limit, wanted)}
 
 
-def _search(unit: str, query: str, limit: int) -> list[dict]:
+def _only(order, sources):
+    """The catalogues in `order` that `sources` names, or all of them."""
+    return [name for name in order if not sources or name in sources]
+
+
+def _search(unit: str, query: str, limit: int,
+            sources: set[str] | None = None) -> list[dict]:
     """Every source that can answer for this unit, merged.
 
     A source that raises is skipped rather than failing the search. These are
@@ -116,7 +133,7 @@ def _search(unit: str, query: str, limit: int) -> list[dict]:
     """
     if unit == "track":
         per_source = []
-        for name in catalog.DEFAULT_ORDER:
+        for name in _only(catalog.DEFAULT_ORDER, sources):
             source = catalog.get(name)
             try:
                 per_source.append(source.search_tracks(query, limit))
@@ -129,7 +146,7 @@ def _search(unit: str, query: str, limit: int) -> list[dict]:
     # editor-written disambiguation prose, which is the whole difficulty in
     # telling two same-named artists apart.
     order = catalog.ARTIST_ORDER if unit == "artist" else catalog.DEFAULT_ORDER
-    for name in order:
+    for name in _only(order, sources):
         source = catalog.get(name)
         method = getattr(source, f"search_{unit}s", None)
         if method is None:
