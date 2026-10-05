@@ -76,6 +76,9 @@ def capabilities(key: str | None) -> dict:
         "version": API_VERSION,
         "units": list(UNITS),
         "sources": list(catalog.DEFAULT_ORDER),
+        # `add` takes `bulk`, and `states` answers for many references in one call.
+        "bulk": True,
+        "batchState": True,
     }
 
 
@@ -184,20 +187,25 @@ def add_route(unit: str = Body(..., embed=True),
               year: str = Body("", embed=True),
               duration: float | None = Body(None, embed=True),
               requested_by: str = Body("", embed=True, alias="requestedBy"),
+              bulk: bool = Body(False, embed=True),
               x_api_key: str | None = Header(default=None)) -> dict:
     return add(unit, ref, source, artist, title, album, year, duration,
-               requested_by, x_api_key)
+               requested_by, x_api_key, bulk)
 
 
 def add(unit: str, ref: str = "", source: str = "deezer", artist: str = "",
         title: str = "", album: str = "", year: str = "",
         duration: float | None = None, requested_by: str = "",
-        key: str | None = None) -> dict:
+        key: str | None = None, bulk: bool = False) -> dict:
     """Add one artist, album or track.
 
     Returns a `reference` the caller keeps and hands back to `state`. It is
     not a want id for the bulk units: an artist add produces hundreds of wants
     and the thing that has a single state is the job that creates them.
+
+    `bulk` says this is one of many, such as a row of an imported list. Bulk
+    wants wait behind their requester's one-at-a-time asks; see
+    `worker.due_wants`.
     """
     _authorise(key)
     if unit not in UNITS:
@@ -211,7 +219,7 @@ def add(unit: str, ref: str = "", source: str = "deezer", artist: str = "",
                     status_code=400, detail="A track needs an artist and a title.")
             want_id, created = db.add_want(
                 conn, artist.strip(), title.strip(), album.strip() or None,
-                year.strip() or None, duration, requested_by or None)
+                year.strip() or None, duration, requested_by or None, bulk=bulk)
             db.log_event(conn, "added" if created else "already-wanted",
                          f"{artist} - {title}", requested_by or "api")
             _nudge()
@@ -225,7 +233,7 @@ def add(unit: str, ref: str = "", source: str = "deezer", artist: str = "",
         label = (f"everything by {artist or ref}" if unit == "artist"
                  else f"the album {title or ref}")
         job_id = db.add_job(conn, unit, ref.strip(), source, label,
-                            requested_by or None)
+                            requested_by or None, bulk=bulk)
         db.log_event(conn, "queued-add", label, f"{unit} from {source}")
         _nudge()
         return {"version": API_VERSION, "ok": True, "unit": unit,
@@ -309,6 +317,45 @@ def _job_state(conn, ident: str) -> dict:
             "have": have, "total": total,
             "message": (f"{have} of {total} tracks in the library."
                         if total else "The add produced no tracks.")}
+
+
+#: The most references one `states` call answers for. A caller with more asks in pages.
+MAX_STATES = 1000
+
+
+@router.post("/states")
+def states_route(references: list[str] = Body(..., embed=True),
+                 x_api_key: str | None = Header(default=None)) -> dict:
+    return states(references, x_api_key)
+
+
+def states(references: list[str], key: str | None = None) -> dict:
+    """`state` for many references at once, on one connection.
+
+    A caller listing somebody's requests used to make one round trip per song,
+    which is fine for ten and is minutes for an imported list of thousands. A
+    reference that `state` would refuse or not find is left out of the answer
+    rather than failing the rest; the caller treats a missing one as unknown.
+    """
+    _authorise(key)
+    if len(references) > MAX_STATES:
+        raise HTTPException(
+            status_code=400, detail=f"At most {MAX_STATES} references per call.")
+    answers: dict[str, dict] = {}
+    conn = db.connect()
+    try:
+        for reference in dict.fromkeys(references):
+            kind, _, ident = reference.partition(":")
+            try:
+                if kind == "want":
+                    answers[reference] = _want_state(conn, ident)
+                elif kind == "job":
+                    answers[reference] = _job_state(conn, ident)
+            except HTTPException:
+                continue
+    finally:
+        conn.close()
+    return {"version": API_VERSION, "states": answers}
 
 
 @router.post("/cancel")

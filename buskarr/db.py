@@ -216,6 +216,11 @@ MIGRATIONS = [
     # are actually stored under, so "has this grab delivered yet" can be asked with the same
     # (artist_lead, album) pair every other query uses.
     ("grabs", "artist_lead", "TEXT"),
+    # Set on wants that arrived in bulk, such as a whole imported list. Within one requester they
+    # wait behind anything asked for one at a time, so an import never delays its owner's next
+    # search. The job carries it so an album or artist add can pass it to the wants it creates.
+    ("wants", "bulk", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "bulk", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -527,7 +532,7 @@ def find_file(conn, artist, title, duration=None, tolerance=4.0):
 
 def add_want(conn, artist, title, album=None, year=None, duration=None, requested_by=None,
              allow_dup=False, batch=None, batch_label=None, artist_lead=None, track_no=None,
-             commit=True):
+             commit=True, bulk=False):
     """Register a wanted song. Returns (id, created).
 
     Unless ``allow_dup``, an addition whose recording is already on disk is recorded as already
@@ -541,6 +546,10 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
     ``track_no`` is the song's position on ``album`` — the pair describe the same release, like
     ``album`` and ``year`` do. Placement prefers it to the acquired file's own tag, whose number
     is the position on whatever release the provider served.
+
+    ``bulk`` marks a want that came in with many others. Asking again one at a time for something
+    already wanted in bulk clears the mark, so the second, deliberate ask is not left waiting
+    behind the list the first one arrived in.
     """
     # Wants are keyed on the STRICT title. norm() strips parentheticals, which would make
     # "Song" and "Song (live)" the same want and silently refuse the second — they are different
@@ -554,7 +563,7 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
     existing = conn.execute("SELECT id FROM wants WHERE norm_artist=? AND norm_title=?",
                             (na, nt)).fetchone()
     if existing:
-        return existing["id"], False
+        return _unbulk(conn, existing["id"], bulk, commit), False
     if not allow_dup:
         # The same master relabelled is not a second song. Every bulk path grew its own guard
         # against this after one provider served one recording to every edition-variant want;
@@ -562,21 +571,34 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
         # allow_dup remains the way to ask for a second copy deliberately.
         twin = find_want_twin(conn, artist, title, duration)
         if twin:
-            return twin["id"], False
+            return _unbulk(conn, twin["id"], bulk, commit), False
     have = None if allow_dup else (find_exact(conn, artist, title, duration)
                                    or find_recording(conn, artist, title, duration))
     cur = conn.execute(
         "INSERT INTO wants (artist,title,norm_artist,norm_title,album,year,duration,track_no,"
-        "requested_by,requested_at,status,file_path,allow_dup,note,batch,batch_label,artist_lead) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "requested_by,requested_at,status,file_path,allow_dup,note,batch,batch_label,artist_lead,"
+        "bulk) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (artist, title, na, nt, album, year, duration, track_no, requested_by, time.time(),
          STATUS_HAVE if have else STATUS_PENDING, have["path"] if have else None,
          1 if allow_dup else 0,
          "already on disk" if have else ("extra copy requested" if allow_dup else None),
-         batch, batch_label, artist_lead))
+         batch, batch_label, artist_lead, 1 if bulk else 0))
     if commit:
         conn.commit()
     return cur.lastrowid, True
+
+
+def _unbulk(conn, want_id, bulk, commit):
+    """Clear the bulk mark on an existing want that has now been asked for on its own.
+
+    Committed even when nothing changed: sqlite3 opens a transaction for an UPDATE that matches
+    no row, and leaving it open holds the write lock for whoever runs next.
+    """
+    if not bulk:
+        conn.execute("UPDATE wants SET bulk=0 WHERE id=? AND bulk<>0", (want_id,))
+        if commit:
+            conn.commit()
+    return want_id
 
 
 def folder_key(name):
@@ -698,12 +720,12 @@ def cancel_batch(conn, batch):
     return cur.rowcount, (kept["n"] if kept else 0)
 
 
-def add_job(conn, kind, ref, source, label=None, requested_by=None):
+def add_job(conn, kind, ref, source, label=None, requested_by=None, bulk=False):
     """Queue a bulk add for the worker. Returns the job id."""
     cur = conn.execute(
-        "INSERT INTO jobs (kind, ref, source, label, requested_by, created_at, status) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (kind, ref, source, label, requested_by, time.time(), JOB_QUEUED))
+        "INSERT INTO jobs (kind, ref, source, label, requested_by, created_at, status, bulk) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (kind, ref, source, label, requested_by, time.time(), JOB_QUEUED, 1 if bulk else 0))
     conn.commit()
     return cur.lastrowid
 

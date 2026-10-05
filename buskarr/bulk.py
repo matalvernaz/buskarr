@@ -147,7 +147,7 @@ def _get(url):
 
 def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer",
               listing=None, attribution=None, enrich=None, enrich_track=None,
-              album_artist=None):
+              album_artist=None, bulk=False):
     """Add every track of an album as an individual want, in one transaction.
 
     Fetched first, written second. Committing per track let the worker claim rows mid-add, past the
@@ -201,7 +201,7 @@ def add_album(conn, album_id, requested_by=None, allow_dup=False, source="deezer
             wid, created = db.add_want(conn, t["artist"], t["title"], title, year,
                                        t["duration"], requested_by, allow_dup=allow_dup,
                                        batch=batch, batch_label=label, artist_lead=lead,
-                                       track_no=t.get("track_no"), commit=False)
+                                       track_no=t.get("track_no"), commit=False, bulk=bulk)
             if not created and db.enrich_want(conn, wid, title, year,
                                               track_no=t.get("track_no"), commit=False):
                 enriched += 1
@@ -440,7 +440,7 @@ def complete_album(conn, want_id, requested_by=None):
 
 
 def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="deezer",
-               max_tracks=0):
+               max_tracks=0, bulk=False):
     """Add an artist's catalogue, one want per track, from any catalogue source.
 
     The whole catalogue is fetched BEFORE anything is written, then every want is inserted in a single
@@ -608,7 +608,7 @@ def add_artist(conn, ref, requested_by=None, skip_repackagings=True, source="dee
                     # on whatever release the provider served — six songs numbered 01 in one
                     # directory. add_album has passed this since the column existed; the artist
                     # add, which is how most of this library arrived, never did.
-                    track_no=track_no, commit=False)
+                    track_no=track_no, commit=False, bulk=bulk)
                 # Only a genuinely new row counts as queued; an already-pending want reported as
                 # "queued" made the summary claim work that never happened.
                 if created:
