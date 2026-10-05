@@ -183,6 +183,40 @@ check(status_of(api.states, references=["want:1"] * (api.MAX_STATES + 1), key=KE
 check(status_of(api.states, references=[], key=None) == 401,
       "and states needs the key like everything else")
 
+# --- a search narrowed to some catalogues ------------------------------------
+called: list[str] = []
+
+
+class _Source:
+    def __init__(self, name):
+        self.name = name
+
+    def search_tracks(self, query, limit):
+        called.append(self.name)
+        return []
+
+    def search_albums(self, query, limit):
+        called.append(self.name)
+        return []
+
+
+real_get = api.catalog.get
+api.catalog.get = _Source
+api.search(q="x", unit="track", limit=5, key=KEY, sources="deezer")
+check(called == ["deezer"], f"sources=deezer asks Deezer alone: {called}")
+called.clear()
+api.search(q="x", unit="album", limit=5, key=KEY, sources="deezer,itunes")
+check(called == ["deezer", "itunes"],
+      f"and two named catalogues in their usual order: {called}")
+called.clear()
+api.search(q="x", unit="track", limit=5, key=KEY)
+check(called == list(api.catalog.DEFAULT_ORDER),
+      f"while no sources asks every catalogue, as before: {called}")
+check(status_of(api.search, q="x", unit="track", limit=5, key=KEY,
+                sources="nonsense") == 400,
+      "a source that does not exist is refused rather than ignored")
+api.catalog.get = real_get
+
 shutil.rmtree(_scratch, ignore_errors=True)
 
 for failure in failures:
