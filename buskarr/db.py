@@ -589,11 +589,14 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
 
 
 def _unbulk(conn, want_id, bulk, commit):
-    """Clear the bulk mark on an existing want that has now been asked for on its own."""
+    """Clear the bulk mark on an existing want that has now been asked for on its own.
+
+    Committed even when nothing changed: sqlite3 opens a transaction for an UPDATE that matches
+    no row, and leaving it open holds the write lock for whoever runs next.
+    """
     if not bulk:
-        changed = conn.execute("UPDATE wants SET bulk=0 WHERE id=? AND bulk<>0",
-                               (want_id,)).rowcount
-        if changed and commit:
+        conn.execute("UPDATE wants SET bulk=0 WHERE id=? AND bulk<>0", (want_id,))
+        if commit:
             conn.commit()
     return want_id
 
