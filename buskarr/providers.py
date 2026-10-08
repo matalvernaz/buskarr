@@ -438,7 +438,6 @@ class Soulseek:
         if not sid:
             return []
         # slskd searches are asynchronous; poll briefly rather than guessing a fixed sleep.
-        responses = []
         for _ in range(20):
             time.sleep(1.5)
             try:
@@ -446,10 +445,23 @@ class Soulseek:
             except Exception:
                 break
             if st and st.get("state", "").lower().startswith("completed"):
-                responses = st.get("responses") or []
                 break
-            if st and (st.get("fileCount") or 0) > 0:
-                responses = st.get("responses") or []
+        # The responses are their own resource. The search itself answers `responses: []`
+        # whatever it found, and reading them from there is why this provider produced not one
+        # candidate from August to October 2026 while slskd logged hundreds of responses for the
+        # very same searches.
+        try:
+            responses = self._api("GET", f"searches/{sid}/responses") or []
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError,
+                ValueError) as e:
+            _log(f"slskd search responses failed: {type(e).__name__}")
+            responses = []
+        finally:
+            # One search per want, and slskd keeps every one until it is told otherwise.
+            try:
+                self._api("DELETE", f"searches/{sid}")
+            except Exception:
+                pass
         out = []
         for resp in responses:
             for f in (resp.get("files") or []):
