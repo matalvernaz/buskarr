@@ -39,6 +39,12 @@ DENO = "deno:" + os.environ.get("DENO_PATH", "/usr/local/bin/deno")
 SLSKD_URL = os.environ.get("SLSKD_URL", "")
 SLSKD_KEY = os.environ.get("SLSKD_API_KEY", "")
 
+# How long an answer about the Tidal account's plan is trusted. status() runs on every page load,
+# so the plan is asked at most this often there; the worker asks again at the top of every cycle.
+TIDAL_PLAN_TTL = int(os.environ.get("TIDAL_PLAN_TTL", "3600"))
+# A check that got no answer (an expired token, Tidal unreachable) is asked again sooner.
+TIDAL_PLAN_RETRY = int(os.environ.get("TIDAL_PLAN_RETRY", "300"))
+
 SEARCH_N = int(os.environ.get("SEARCH_N", "5"))
 # Pace outbound requests: bursts are what provoke YouTube session throttling and Soulseek
 # per-user rejections. Sequential and unhurried beats parallel and blocked.
@@ -108,6 +114,16 @@ def _flock(path):
 
 # --------------------------------------------------------------------------- Tidal
 
+def _tidal_subscription(auth):
+    """The account's subscription as Tidal reports it. Raises on any failure; read-only."""
+    q = urllib.parse.urlencode({"countryCode": auth.get("country_code", "US")})
+    req = urllib.request.Request(
+        f"https://api.tidal.com/v1/users/{auth['user_id']}/subscription?{q}",
+        headers={"Authorization": f"Bearer {auth['token']}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as fh:
+        return json.load(fh)
+
+
 class Tidal:
     name = "tidal"
     quality_hint = "FLAC 16/44"
@@ -130,15 +146,67 @@ class Tidal:
         """
         if not TIDDL_AUTH:
             return False, False, "TIDDL_AUTH is not set"
-        if self._usable(self._live_path()):
+        live_ok = self._usable(self._live_path())
+        spare = None if live_ok else next(
+            (p for p in (TIDAL_AUTH_BACKUP, TIDAL_AUTH_JSON) if self._usable(p)), None)
+        if not live_ok and not spare:
+            return False, False, (f"no usable session at {self._live_path()} and no recoverable "
+                                  "copy — re-authenticate with: tiddl auth login")
+        # A session that works says nothing about whether the account may download. Only a plan
+        # that refuses outright takes Tidal out; an unanswered check leaves it in, as before.
+        can_download, why = self.plan()
+        if can_download is False:
+            return False, False, why
+        if live_ok:
             return True, True, "authenticated"
-        spare = next((p for p in (TIDAL_AUTH_BACKUP, TIDAL_AUTH_JSON) if self._usable(p)), None)
-        if spare:
-            return True, False, (f"the live session at {self._live_path()} is damaged; it is "
-                                 f"rebuilt from {spare} at the start of every cycle, so downloads "
-                                 "continue. Recurring means something is killing tiddl mid-write")
-        return False, False, (f"no usable session at {self._live_path()} and no recoverable copy "
-                              "— re-authenticate with: tiddl auth login")
+        return True, False, (f"the live session at {self._live_path()} is damaged; it is "
+                             f"rebuilt from {spare} at the start of every cycle, so downloads "
+                             "continue. Recurring means something is killing tiddl mid-write")
+
+    # (expires_at, can_download, why), shared by every instance: the worker's provider list and the
+    # web page's are different objects asking about the same account.
+    _plan = None
+
+    def plan(self, force=False):
+        """``(can_download, why)`` for the account's plan. ``can_download`` is None if unknown.
+
+        A lapsed plan leaves the sign-in, the token refresh and the search all working; only the
+        download is refused. Hit 2026-10-08: the account fell to Tidal's free plan on 10-01, and
+        for a week every song cost two to four tiddl runs refused with 401 "Requested quality is
+        not allowed in user's subscription" (tiddl reports it as "Response body does not contain
+        valid json") before falling through to YouTube, while this provider reported itself
+        authenticated and healthy.
+
+        Unknown is not refusal. A check made with an expired token, or while Tidal is unreachable,
+        answers nothing about the plan, and treating that as "free" would turn a network blip into
+        an outage. ``force`` asks again regardless of the cached answer; the worker does that right
+        after refreshing the token, which is when a check can actually be answered.
+        """
+        now = time.time()
+        cached = Tidal._plan
+        if cached and not force and now < cached[0]:
+            return cached[1], cached[2]
+        try:
+            data = _tidal_subscription(self._read_auth())
+        except urllib.error.HTTPError as e:
+            answer, ttl = (None, f"Tidal plan check failed: HTTP {e.code}"), TIDAL_PLAN_RETRY
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            # URLError and timeouts are OSErrors, a bad body is a ValueError, a session without a
+            # user id is a KeyError: none of them says anything about the plan.
+            answer, ttl = (None, f"Tidal plan check failed: {type(e).__name__}"), TIDAL_PLAN_RETRY
+        else:
+            sub = data.get("subscription") if isinstance(data, dict) else None
+            kind = str((sub or {}).get("type") or "").strip()
+            if (isinstance(data, dict) and data.get("premiumAccess") is False) \
+                    or kind.upper() == "FREE":
+                answer = (False, f"the Tidal account is on the {kind.lower() or 'free'} plan, "
+                                 "which cannot download; Tidal is skipped until the plan allows "
+                                 "downloads again")
+            else:
+                answer = (True, f"the Tidal account's plan allows downloads ({kind or 'paid'})")
+            ttl = TIDAL_PLAN_TTL
+        Tidal._plan = (now + ttl, *answer)
+        return answer
 
     @staticmethod
     def _live_path():
