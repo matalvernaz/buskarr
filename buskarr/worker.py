@@ -736,6 +736,30 @@ def next_wait(conn, held_back):
 _held_back = False
 
 
+def ready(provs):
+    """The available providers this cycle may actually use, after refreshing Tidal's token.
+
+    Tidal's plan is asked again here, AFTER the refresh, and not only in ``status()``: a check made
+    with an expired token gets no answer, and no answer leaves Tidal in. Without this second look a
+    lapsed plan slips through whenever the cached answer has aged out, and every want in the cycle
+    pays for tiddl runs that cannot succeed.
+    """
+    out = []
+    for e in provs:
+        if e["name"] == "tidal":
+            try:
+                e["provider"].refresh()
+            except Exception as ex:
+                # A hung tiddl must not cost the whole cycle; searches then fail loudly per want.
+                log(f"tidal: refresh failed ({type(ex).__name__}); continuing with the old token")
+            can_download, why = e["provider"].plan(force=True)
+            if can_download is False:
+                log(f"provider tidal UNAVAILABLE: {why}")
+                continue
+        out.append(e)
+    return out
+
+
 def cycle(conn):
     global _held_back
     _held_back = False
@@ -768,18 +792,12 @@ def cycle(conn):
             log(f"provider {e['name']} UNAVAILABLE: {e['detail']}")
         elif not e["healthy"]:
             log(f"provider {e['name']} DEGRADED: {e['detail']}")
+    provs = ready(provs)
     if not provs:
         log("no providers available — nothing to do")
         _held_back = True
         return 0
     log(f"providers: {', '.join(e['name'] for e in provs)}")
-    for e in provs:
-        if e["name"] == "tidal":
-            try:
-                e["provider"].refresh()
-            except Exception as ex:
-                # A hung tiddl must not cost the whole cycle; searches then fail loudly per want.
-                log(f"tidal: refresh failed ({type(ex).__name__}); continuing with the old token")
 
     now = time.time()
     # Age out Soulseek enqueues that never delivered, or the want is stuck in SEARCHING forever —
