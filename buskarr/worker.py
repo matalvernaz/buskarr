@@ -334,11 +334,31 @@ def tag(path, want, track=None):
         return False
 
 
+def _peer_never_delivered(want):
+    """Whether the stale reaper just sent this want back from a Soulseek peer that never sent it."""
+    return (want["provider"] == "soulseek"
+            and (want["note"] or "").startswith("peer queue timed out"))
+
+
 def attempt(conn, want, provs):
     """Try every provider for one want. Returns 'have', 'unavailable' or 'empty'."""
     saw_any_candidate = False
+    # Once, for a want whose last Soulseek peer never delivered: the next provider gets it this
+    # time. Otherwise Soulseek is asked first again, queues at another peer that may never send
+    # either, and the want can wait out SEARCH_STALE after SEARCH_STALE without YouTube ever
+    # being tried. The note changes with this attempt, so the skip does not stick.
+    skip = {"soulseek"} if _peer_never_delivered(want) else set()
+    if skip:
+        # Written now, not left to the outcome: an "empty" result keeps the note, and the skip
+        # would then hold for every attempt after this one.
+        conn.execute("UPDATE wants SET note=? WHERE id=?",
+                     ("trying other providers: a Soulseek peer never delivered", want["id"]))
+        conn.commit()
     for entry in provs:
         p = entry["provider"]
+        if p.name in skip:
+            log(f"    {p.name}: skipped this time, its last peer never delivered")
+            continue
         try:
             candidates = p.search(dict(want))
         except providers.RateLimited:
@@ -642,9 +662,15 @@ def run_harvest(conn):
     if expired:
         log(f"  {expired} grab(s) never delivered within {HARVEST_WINDOW // 86400} days; "
             "no longer waiting on them")
-    if not outstanding:
+    # A file queued at a Soulseek peer lands in slskd's download tree, which harvest walks; the
+    # harvest is what places it. It used to run only while a torrent grab was outstanding, so a
+    # Soulseek download arrived and sat there until one happened to be.
+    peers = conn.execute("SELECT COUNT(*) n FROM wants WHERE status=? AND provider=?",
+                         (db.STATUS_SEARCHING, "soulseek")).fetchone()["n"]
+    if not outstanding and not peers:
         return 0
-    log(f"  {len(outstanding)} grab(s) awaiting import — harvesting")
+    log(f"  {len(outstanding)} grab(s) and {peers} Soulseek download(s) awaiting import — "
+        "harvesting")
     from . import harvest                  # deferred: harvest imports this module
     try:
         harvest.harvest(conn, dry_run=False, log=lambda m: log(f"  {m}"))
