@@ -38,6 +38,13 @@ COOKIES = os.environ.get("YT_COOKIES", "/state/cookies.txt")
 DENO = "deno:" + os.environ.get("DENO_PATH", "/usr/local/bin/deno")
 SLSKD_URL = os.environ.get("SLSKD_URL", "")
 SLSKD_KEY = os.environ.get("SLSKD_API_KEY", "")
+# slskd ends a search when this many peers have answered, or after SLSKD_SEARCH_TIMEOUT ms with no
+# new answer. Without a limit a popular song keeps a search open for half a minute after its
+# answers arrived in three seconds, and its results cannot be read until it ends.
+SLSKD_RESPONSE_LIMIT = int(os.environ.get("SLSKD_RESPONSE_LIMIT", "100"))
+SLSKD_SEARCH_TIMEOUT = int(os.environ.get("SLSKD_SEARCH_TIMEOUT", "15000"))
+# How long to wait for a search to end. The longest seen without a response limit was 49 s.
+SLSKD_SEARCH_WAIT = float(os.environ.get("SLSKD_SEARCH_WAIT", "90"))
 
 # How long an answer about the Tidal account's plan is trusted. status() runs on every page load,
 # so the plan is asked at most this often there; the worker asks again at the top of every cycle.
@@ -430,22 +437,31 @@ class Soulseek:
     def search(self, want):
         text = f"{want['artist']} {want['title']}"
         try:
-            started = self._api("POST", "searches", {"searchText": text})
+            started = self._api("POST", "searches", {"searchText": text,
+                                                     "responseLimit": SLSKD_RESPONSE_LIMIT,
+                                                     "searchTimeout": SLSKD_SEARCH_TIMEOUT})
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as e:
             _log(f"slskd search failed: {type(e).__name__}")
             return []
         sid = (started or {}).get("id")
         if not sid:
             return []
-        # slskd searches are asynchronous; poll briefly rather than guessing a fixed sleep.
-        for _ in range(20):
+        # slskd searches are asynchronous; poll until it ends rather than guessing a fixed sleep.
+        # The responses can only be read once it has: until then `/responses` answers nothing.
+        done = False
+        deadline = time.monotonic() + SLSKD_SEARCH_WAIT
+        while not done and time.monotonic() < deadline:
             time.sleep(1.5)
             try:
                 st = self._api("GET", f"searches/{sid}")
             except Exception:
                 break
-            if st and st.get("state", "").lower().startswith("completed"):
-                break
+            done = bool(st) and st.get("state", "").lower().startswith("completed")
+        if not done:
+            # Deleting a search slskd is still running makes it fail to save the search ("The
+            # database operation was expected to affect 1 row"), so it is left to finish.
+            _log(f"slskd search for {text[:60]!r} did not finish in {SLSKD_SEARCH_WAIT:.0f}s")
+            return []
         # The responses are their own resource. The search itself answers `responses: []`
         # whatever it found, and reading them from there is why this provider produced not one
         # candidate from August to October 2026 while slskd logged hundreds of responses for the

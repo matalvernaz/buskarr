@@ -6,8 +6,10 @@ own resource, ``/searches/{id}/responses``), so every want went on to YouTube wh
 two hundred responses for the same search. And a file it did queue at a peer was only placed by the
 harvest, which ran only while a torrent grab was outstanding.
 
-The fake here answers exactly what slskd 0.26 answered on the live server: a completed search with
-an empty ``responses`` list, and the files under ``/responses``.
+The fake here answers what slskd 0.26 answered on the live server: a search stays InProgress for
+a while (30 s for a popular song with no response limit, 49 s the longest seen), ``/responses`` is
+empty until it has ended, the search itself never carries them, and deleting a search that is still
+running makes slskd fail to save it.
 """
 import os
 import sys
@@ -39,22 +41,30 @@ RESPONSES = [{
 class Slskd:
     """The handful of slskd answers a search touches, with every call written down."""
 
-    def __init__(self, responses=RESPONSES, fail_responses=False):
+    def __init__(self, responses=RESPONSES, fail_responses=False, polls_to_finish=1):
         self.responses, self.fail_responses, self.calls = responses, fail_responses, []
+        self.polls_to_finish, self.polls, self.body = polls_to_finish, 0, None
+        self.deleted_while_running = False
+
+    def finished(self):
+        return self.polls >= self.polls_to_finish
 
     def __call__(self, method, path, body=None):
         self.calls.append((method, path))
         if (method, path) == ("POST", "searches"):
+            self.body = body
             return {"id": "s-1", "state": "InProgress"}
         if (method, path) == ("GET", "searches/s-1"):
-            # What the live server answers: complete, counted, and no responses in it.
-            return {"id": "s-1", "state": "Completed, TimedOut", "responseCount": 1,
-                    "fileCount": 2, "responses": []}
+            self.polls += 1
+            # The search never carries its responses, running or not.
+            return {"id": "s-1", "responseCount": 1, "fileCount": 2, "responses": [],
+                    "state": "Completed, ResponseLimitReached" if self.finished() else "InProgress"}
         if (method, path) == ("GET", "searches/s-1/responses"):
             if self.fail_responses:
                 raise OSError("connection reset")
-            return self.responses
+            return self.responses if self.finished() else []
         if (method, path) == ("DELETE", "searches/s-1"):
+            self.deleted_while_running |= not self.finished()
             return None
         raise AssertionError(f"unexpected slskd call {method} {path}")
 
@@ -76,6 +86,27 @@ def run():
               ("peer-one", 21000000, 175.0))
         check("read from the responses resource", ("GET", "searches/s-1/responses") in api.calls, True)
         check("and the search is deleted afterwards", api.calls[-1], ("DELETE", "searches/s-1"))
+        check("slskd is asked to stop at a hundred answers",
+              (api.body or {}).get("responseLimit"), 100)
+
+        print("\na popular song's search runs long, and is waited for")
+        api = Slskd(polls_to_finish=25)
+        slsk._api = api
+        check("its candidates arrive once it has ended", len(slsk.search(dict(WANT))), 1)
+        check("and it was not deleted while running", api.deleted_while_running, False)
+
+        print("\na search that does not end in time gives nothing, and is left to finish")
+        api = Slskd(polls_to_finish=10 ** 9)
+        slsk._api = api
+        saved_wait = providers.SLSKD_SEARCH_WAIT
+        providers.SLSKD_SEARCH_WAIT = 0.05
+        try:
+            check("nothing found", slsk.search(dict(WANT)), [])
+        finally:
+            providers.SLSKD_SEARCH_WAIT = saved_wait
+        check("not deleted, so slskd can still save it", ("DELETE", "searches/s-1") in api.calls, False)
+        check("and its empty responses were never read as an answer",
+              ("GET", "searches/s-1/responses") in api.calls, False)
 
         print("\nresponses that cannot be read are no candidates, and the search still goes")
         api = Slskd(fail_responses=True)
