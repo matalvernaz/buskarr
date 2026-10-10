@@ -755,6 +755,21 @@ def due_wants(conn, now, limit):
          now, db.STATUS_UNAVAILABLE, limit)).fetchall()
 
 
+def still_due(conn, want_id, now):
+    """The want as it stands now, if a cycle should still work it; else None.
+
+    A cycle takes its list when it starts and can run for most of an hour (37 wants took 51
+    minutes on 2026-10-10), and each want used to be worked from that first copy. One marked had
+    at 11:41, because the song was already held under another credit, was queued at a Soulseek
+    peer at 12:04 and set back to searching; one moved to its artist's existing directory at
+    11:37 was filed under its old one at 11:52. Same conditions as ``due_wants``.
+    """
+    return conn.execute(
+        "SELECT * FROM wants WHERE id=? AND status IN (?,?,?) "
+        "AND (retry_after IS NULL OR retry_after<?)",
+        (want_id, db.STATUS_PENDING, db.STATUS_FAILED, db.STATUS_UNAVAILABLE, now)).fetchone()
+
+
 def fresh_work_due(conn, now):
     """Whether a want that has not yet missed is waiting for a cycle.
 
@@ -863,7 +878,11 @@ def cycle(conn):
     log(f"{len(rows)} want(s) this cycle (cap {PER_CYCLE})")
 
     got = 0
-    for w in rows:
+    for listed in rows:
+        w = still_due(conn, listed["id"], now)
+        if w is None:
+            log(f"  {listed['artist']} - {listed['title']}: changed since this cycle began; skipped")
+            continue
         log(f"  {w['artist']} - {w['title']}")
         try:
             outcome = attempt(conn, w, provs)
