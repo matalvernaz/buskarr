@@ -736,8 +736,9 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
     ``match_album`` is for a song added on its own (the API's track add, the Add form). Its album
     is the catalogue's label for whichever edition that catalogue listed, so it is matched against
     the albums this artist already has (``canonical_album``) and joins the one that is the same
-    record. The album and artist adds leave it off: they file from one release's own listing, and
-    keep a deluxe edition apart on purpose.
+    record; and a collaboration with no lead given files under the lead's existing directory
+    (``existing_lead``). The album and artist adds leave it off: they file from one release's own
+    listing, and keep a deluxe edition apart on purpose.
     """
     # Wants are keyed on the STRICT title. norm() strips parentheticals, which would make
     # "Song" and "Song (live)" the same want and silently refuse the second — they are different
@@ -746,7 +747,13 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
     # Derived here when the caller has no catalogue answer — a hand-typed want used to be inserted
     # with a NULL lead, which guaranteed the next page load turned into a write transaction to fill
     # it in. Steady state should be read-only.
+    caller_lead = artist_lead
     artist_lead = folder_key(artist_lead or credit.lead_artist(artist))
+    if match_album and not caller_lead:
+        # A song on its own carries no catalogue lead, and "&" never splits, so a duet made a
+        # folder of its own ("Zedd & Alessia Cara") beside the lead's. fold's rule, applied as the
+        # song arrives rather than after: the lead must already have a directory.
+        artist_lead = existing_lead(conn, artist) or artist_lead
     na, nt = norm(artist), strict_norm(title)
     existing = conn.execute("SELECT id FROM wants WHERE norm_artist=? AND norm_title=?",
                             (na, nt)).fetchone()
@@ -781,6 +788,28 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
     if commit:
         conn.commit()
     return cur.lastrowid, True
+
+
+def existing_lead(conn, artist):
+    """The artist directory a collaboration credit belongs in, when its lead already has one.
+
+    ``fold``'s rule, ``credit.credited_to``: the credit must start with the lead and continue with
+    a joiner ("&", "with", "feat."...), so "Zedd & Alessia Cara" joins "Zedd" while "Celtic Woman
+    feat. The Longest Johns", where they are the guest, does not join them, and "Simon &
+    Garfunkel" stays itself unless a directory named "Simon" exists. The longest lead wins.
+    Compared on each directory's display spelling, since "AC/DC & X" does not start with "AC_DC".
+    """
+    from . import credit
+    names = {}
+    for r in conn.execute("SELECT DISTINCT artist_lead, lead_display FROM wants "
+                          "WHERE artist_lead IS NOT NULL"):
+        names.setdefault(r["artist_lead"], r["lead_display"] or r["artist_lead"])
+    for r in conn.execute("SELECT DISTINCT artist_lead FROM files WHERE artist_lead IS NOT NULL"):
+        names.setdefault(r["artist_lead"], r["artist_lead"])
+    whole = credit._loose(artist)
+    found = [(folder, shown) for folder, shown in names.items()
+             if credit._loose(shown) != whole and credit.credited_to(artist, shown)]
+    return max(found, key=lambda f: len(f[1]))[0] if found else None
 
 
 def _unbulk(conn, want_id, bulk, commit):
