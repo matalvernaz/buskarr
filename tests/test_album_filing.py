@@ -177,6 +177,35 @@ try:
     conn.close()
     shutil.rmtree(d, ignore_errors=True)
 
+    print("\n=== a duet added on its own files under its lead's directory ===")
+    conn, d = fresh()
+    held(conn, "Zedd", "Clarity", "Clarity", "2012")
+    held(conn, "The Longest Johns", "Wellerman", "Smoke & Oakum", "2018")
+    held(conn, "AC/DC", "Thunderstruck", "The Razors Edge", "1990")
+    lead = lambda wid: conn.execute("SELECT artist_lead FROM wants WHERE id=?", (wid,)).fetchone()[0]
+    wid, _ = db.add_want(conn, "Zedd & Alessia Cara", "Stay", "Stay", "2017", 210.0, "defender",
+                         match_album=True)
+    check("an & credit joins the lead's existing directory", lead(wid) == "Zedd", lead(wid))
+    wid, _ = db.add_want(conn, "Simon & Garfunkel", "Mrs. Robinson", "Bookends", "1968", 244.0,
+                         "defender", match_album=True)
+    check("a band named with & stays itself when no lead directory exists",
+          lead(wid) == "Simon & Garfunkel", lead(wid))
+    wid, _ = db.add_want(conn, "Celtic Woman feat. The Longest Johns", "Song", "An Album", None,
+                         200.0, "defender", match_album=True)
+    check("a guest appearance stays with the act whose release it is",
+          lead(wid) == "Celtic Woman", lead(wid))
+    wid, _ = db.add_want(conn, "AC/DC & Someone", "Duet", "A Single", None, 200.0, "defender",
+                         match_album=True)
+    check("a lead whose directory name was sanitised is still found", lead(wid) == "AC_DC", lead(wid))
+    wid, _ = db.add_want(conn, "Zedd & Foxes", "Clarity (Live)", "Live", None, 280.0, "matt",
+                         artist_lead="Foxes")
+    check("a lead the caller names is kept", lead(wid) == "Foxes", lead(wid))
+    wid, _ = db.add_want(conn, "Zedd & Hayley Williams", "Stay the Night", "Clarity", "2012",
+                         217.0, "matt")
+    check("an album or artist add is unchanged", lead(wid) == "Zedd & Hayley Williams", lead(wid))
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
+
     print("\n=== one display spelling per artist directory ===")
     check("AC/DC from its directory", db.lead_display_for("AC/DC", "AC_DC") == "AC/DC")
     check("the full stop the directory dropped",
