@@ -45,7 +45,7 @@ LIBRARY = os.environ.get("LIBRARY_DIR", "/music")
 _LEADING_ARTICLE = re.compile(r"^(?:the|a|an)\s+")
 
 
-def album_artist_fix(existing, folder_artist, artist_dirs):
+def album_artist_fix(existing, folder_artist, artist_dirs, display=None):
     """The spelling to write into the albumartist tag, or None to leave it alone.
 
     Jellyfin groups albums on this tag, not on the directory, so a tag that is missing or merely
@@ -56,21 +56,31 @@ def album_artist_fix(existing, folder_artist, artist_dirs):
     Gated on positive evidence that the tag names the artist whose folder the file is in. A tag
     naming somebody else is a misfiled album, and quietly overwriting it with the folder name
     would destroy the only remaining evidence of that.
+
+    ``display`` is how the directory's own wants spell the act (``wants.lead_display``), and it is
+    what gets written. The directory name has been through ``worker.safe``: writing it made every
+    "AC/DC" tag "AC_DC" and took the full stop off "Wheeler Walker Jr.", which is the split this
+    function exists to close. Falls back to the folder name when no want says otherwise.
     """
     existing = (existing or "").strip()
-    if existing == folder_artist:
+    target = display if display and worker.safe(display) == folder_artist else folder_artist
+    if existing == target:
         return None
     if not existing:
-        return folder_artist
+        return target
+    if worker.safe(existing) == folder_artist:
+        # Both name this folder. The directory's agreed spelling replaces another one, but with
+        # none known, a tag that kept what the folder name had to drop ("M.I.A.") stays.
+        return target if target != folder_artist else None
     folder_key = credit._loose(folder_artist)
     if not folder_key:
         return None
     if credit._loose(existing) == folder_key:
-        return folder_artist                                   # punctuation or case only
+        return target                                          # punctuation or case only
     if credit._loose(credit.lead_artist(existing)) == folder_key:
-        return folder_artist                                   # "A feat. B" filed under A
+        return target                                          # "A feat. B" filed under A
     if credit.credited_to(existing, folder_artist):
-        return folder_artist                                   # "A & B" filed under A
+        return target                                          # "A & B" filed under A
     # A leading article is the last difference accepted, and only when the tag is not itself an
     # artist directory here: "Arrogant Worms" inside "The Arrogant Worms" is one act, while
     # "Moon Hooch" inside "Jonathan Coulton" is a misfiled album that must stay visible.
@@ -78,7 +88,7 @@ def album_artist_fix(existing, folder_artist, artist_dirs):
         return None
     if (_LEADING_ARTICLE.sub("", credit._loose(existing))
             == _LEADING_ARTICLE.sub("", folder_key)):
-        return folder_artist
+        return target
     return None
 
 
@@ -185,6 +195,13 @@ def find_suspect(conn):
         if len(parts) > 1 and not rel.startswith(".."):
             artist_dirs.add(parts[0])
 
+    # How each directory's own wants spell its act, which is what the albumartist should say.
+    displays = {}
+    for d in conn.execute("SELECT artist_lead, lead_display, COUNT(*) n FROM wants "
+                          "WHERE lead_display IS NOT NULL GROUP BY artist_lead, lead_display "
+                          "ORDER BY n DESC").fetchall():
+        displays.setdefault(d["artist_lead"], d["lead_display"])
+
     out = []
     for r in rows:
         file_title = (r["file_title"] or "").strip()
@@ -221,7 +238,8 @@ def find_suspect(conn):
                 reason = reason or REASON_ARTIST
                 proposed["artist"] = folder_artist
         if folder_artist:
-            fixed = album_artist_fix(r["album_artist"], folder_artist, artist_dirs)
+            fixed = album_artist_fix(r["album_artist"], folder_artist, artist_dirs,
+                                     displays.get(folder_artist))
             if fixed is not None:
                 reason = reason or REASON_ALBUM_ARTIST
                 proposed["album_artist"] = fixed

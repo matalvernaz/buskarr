@@ -13,6 +13,7 @@ Identity is (artist, title, duration) rather than any external ID. That is delib
 MusicBrainz is what caps a library at whatever MusicBrainz happens to know, which for
 novelty/web-native artists is a small fraction of reality.
 """
+import collections
 import os
 import re
 import sqlite3
@@ -221,6 +222,12 @@ MIGRATIONS = [
     # search. The job carries it so an album or artist add can pass it to the wants it creates.
     ("wants", "bulk", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "bulk", "INTEGER NOT NULL DEFAULT 0"),
+    # The lead artist as the catalogue spells it, for the albumartist TAG. `artist_lead` is the
+    # directory form, which `safe()` has been through: "AC/DC" is "AC_DC" there and
+    # "Wheeler Walker Jr." loses its full stop. Tagged with that, Jellyfin listed "AC_DC" as an
+    # artist beside the "AC/DC" in the track credits. One spelling per directory, so a folder whose
+    # catalogues disagree ("Thomas Benjamin Wild Esq." / "... Esq") still groups as one act.
+    ("wants", "lead_display", "TEXT"),
 ]
 
 
@@ -246,6 +253,7 @@ def migrate(conn):
         raise
     backfill_artist_lead(conn)
     backfill_file_lead(conn)
+    backfill_lead_display(conn)
 
 
 def backfill_artist_lead(conn):
@@ -273,6 +281,78 @@ def backfill_artist_lead(conn):
                      [(folder_key(credit.lead_artist(r["artist"])), r["id"]) for r in rows])
     conn.commit()
     return len(rows)
+
+
+def backfill_lead_display(conn):
+    """Give every want the display spelling of its lead artist. Returns how many were filled.
+
+    Decided per DIRECTORY, not per want: the spelling most of that folder's credits use among those
+    that sanitise to it, so the one folder whose catalogues disagree gets one albumartist rather
+    than two. Only rows still NULL are touched, which after the first run is none.
+    """
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wants'").fetchone():
+        return 0
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(wants)")}
+    if "lead_display" not in have:
+        return 0
+    rows = conn.execute("SELECT id, artist, artist_lead FROM wants "
+                        "WHERE lead_display IS NULL AND artist_lead IS NOT NULL").fetchall()
+    if not rows:
+        return 0
+    leads = {r["artist_lead"] for r in rows}
+    chosen = {}
+    for lead in leads:
+        counts = collections.Counter()
+        for w in conn.execute("SELECT artist, lead_display FROM wants WHERE artist_lead=?", (lead,)):
+            counts[w["lead_display"] or lead_display_for(w["artist"], lead)] += 1
+        chosen[lead] = _pick_display(counts, lead)
+    # "AND lead_display IS NULL" again in the UPDATE, for the reason backfill_artist_lead gives.
+    conn.executemany("UPDATE wants SET lead_display=? WHERE id=? AND lead_display IS NULL",
+                     [(chosen[r["artist_lead"]], r["id"]) for r in rows])
+    conn.commit()
+    return len(rows)
+
+
+def _credit_parts(artist):
+    """The names a credit may be filing under, most likely first."""
+    from . import credit
+    full = (artist or "").strip()
+    out = [credit.lead_artist(full), full]
+    out += re.split(r"\s*(?:&|,|\+|\bx\b|\band\b|\bwith\b|\bvs\.?)\s*", full, flags=re.I)
+    return [p.strip() for p in out if p and p.strip()]
+
+
+def lead_display_for(artist, artist_lead):
+    """The lead artist as ``artist``, the full credit, spells it: "AC/DC" for the folder "AC_DC".
+
+    The part of the credit whose directory form IS the folder. Falls back to the folder itself when
+    no part sanitises to it — a compilation filed under "Various Artists", or a lead the catalogue
+    named that the credit does not repeat — which is exactly what was written before.
+    """
+    if not artist_lead:
+        from . import credit
+        return credit.lead_artist(artist)
+    for part in _credit_parts(artist):
+        if folder_key(part) == artist_lead:
+            return part
+    return artist_lead
+
+
+def _pick_display(counts, artist_lead):
+    """The most used spelling, preferring one that keeps what the folder name had to drop."""
+    if not counts:
+        return artist_lead
+    return max(counts, key=lambda s: (counts[s], s != artist_lead, s))
+
+
+def folder_display(conn, artist_lead):
+    """The display spelling a directory already uses, or None if it has no wants yet."""
+    if not artist_lead:
+        return None
+    r = conn.execute("SELECT lead_display, COUNT(*) n FROM wants WHERE artist_lead=? "
+                     "AND lead_display IS NOT NULL GROUP BY lead_display "
+                     "ORDER BY n DESC, lead_display LIMIT 1", (artist_lead,)).fetchone()
+    return r["lead_display"] if r else None
 
 
 def backfill_file_lead(conn):
@@ -416,6 +496,108 @@ def _same_recording(title_a, title_b, dur_a, dur_b, tolerance=TWIN_DURATION):
     return perf(title_a) == perf(title_b)
 
 
+# Words that only say how an ALBUM was packaged for sale. A bracketed segment, or a trailing
+# " - ..." suffix, made of nothing else names the record already on the shelf: "Greatest Hits
+# (Deluxe)", "Led Zeppelin IV (Remaster)", "Hello, I Must Be Going! (2016 Remaster)",
+# "ECHO - Single". A segment with any other word in it stays, because that word is what makes it
+# another release: "(Taylor's Version)" is a re-recording, "(The Late Night Edition)" adds songs,
+# "(Big Machine Radio release special)" is a radio disc. A bare year stays too: "discography (2015)"
+# and "discography (2016)" are two releases.
+ALBUM_PACKAGING = frozenset(
+    "remaster remastered remasters remastering mastered deluxe super expanded anniversary edition "
+    "editions version versions bonus track tracks special collector collectors legacy reissue "
+    "reissued mono stereo explicit clean digital single ep".split())
+_ALBUM_FILLER = re.compile(r"^(?:\d+(?:st|nd|rd|th)?|years?|the|a|an|re|s)$")
+_ALBUM_SEGMENT = re.compile(r"\s*[\(\[]([^\(\)\[\]]*)[\)\]]")
+_ALBUM_SUFFIX = re.compile(r"\s+[-–—]\s+([^-–—]+)$")
+
+
+def _album_words(text):
+    s = unicodedata.normalize("NFKD", text or "").casefold().replace("’", "'")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^\w]+", " ", s).split()
+
+
+def _packaging_only(text):
+    words = _album_words(text)
+    return (any(w in ALBUM_PACKAGING for w in words)
+            and all(w in ALBUM_PACKAGING or _ALBUM_FILLER.match(w) for w in words))
+
+
+def album_fold(album):
+    """An album name reduced to what identifies the release: packaging, case and punctuation gone.
+
+    Two albums by one artist that fold equal are the same record under labels that differ only in
+    how it was sold. Song-by-song adds are where that matters: each song arrives with whatever
+    edition its catalogue listed, so one album came in as "Take Me To The Alley" and "Take Me to
+    the Alley", or as four spellings of "Hello, I Must Be Going", each a directory of its own.
+    """
+    s = album or ""
+    prev = None
+    while s != prev:
+        prev = s
+        s = _ALBUM_SEGMENT.sub(lambda m: " " if _packaging_only(m.group(1)) else m.group(0), s)
+        m = _ALBUM_SUFFIX.search(s)
+        if m and _packaging_only(m.group(1)):
+            s = s[:m.start()]
+    return " ".join(_album_words(s))
+
+
+def _year4(year):
+    y = str(year or "").strip()[:4]
+    return y if y.isdigit() else None
+
+
+def album_spelling(album):
+    """Case and curly-quote insensitive form, for "is this the same name as typed"."""
+    s = unicodedata.normalize("NFKC", album or "").casefold().replace("’", "'")
+    return " ".join(s.split())
+
+
+def canonical_album(conn, artist_lead, album, year=None):
+    """The (album, year) a song-by-song addition should file under.
+
+    An album this artist already has that is the same record (``album_fold``) wins over the
+    catalogue's label for it, so the song joins the directory its album-mates are in instead of
+    starting another. The match is only within one artist's directory. Two albums spelled the same
+    whose known years are more than one apart are different releases that share a name — four of
+    Peter Gabriel's are called "Peter Gabriel" — while an edition's later year is expected: "(2011
+    Remaster)" came out in 2011, and is still the 1988 album.
+
+    When several albums already fold to the same record, an edition spelled exactly as asked is
+    taken — an artist add keeps a deluxe edition apart on purpose, and a song from it belongs
+    there — and otherwise the one holding the most songs. Returns the arguments unchanged when
+    nothing matches.
+    """
+    if not album or not artist_lead:
+        return album, year
+    key = album_fold(album)
+    if not key:
+        return album, year
+    asked_year = _year4(year)
+    found = []
+    for r in conn.execute(
+            "SELECT album, year, COUNT(*) n, "
+            "SUM(CASE WHEN status=? AND file_path IS NOT NULL THEN 1 ELSE 0 END) held, "
+            "MIN(requested_at) first FROM wants WHERE artist_lead=? AND album IS NOT NULL "
+            "AND album<>'' GROUP BY album, year", (STATUS_HAVE, artist_lead)):
+        if album_fold(r["album"]) != key:
+            continue
+        their_year = _year4(r["year"])
+        if (asked_year and their_year and abs(int(asked_year) - int(their_year)) > 1
+                and album_spelling(r["album"]) == album_spelling(album)):
+            continue
+        found.append(r)
+    if not found:
+        return album, year
+    exact = [r for r in found if album_spelling(r["album"]) == album_spelling(album)]
+    pool = exact or found
+    best = max(pool, key=lambda r: (r["held"] or 0, r["n"],
+                                    album_fold(r["album"]) == " ".join(_album_words(r["album"])),
+                                    bool(_year4(r["year"])), -(r["first"] or 0)))
+    return best["album"], best["year"]
+
+
 def _credit_kin(artist_a, artist_b):
     """True when either credit is led by the other — "Act" against "Act & Guest"."""
     from . import credit
@@ -532,7 +714,7 @@ def find_file(conn, artist, title, duration=None, tolerance=4.0):
 
 def add_want(conn, artist, title, album=None, year=None, duration=None, requested_by=None,
              allow_dup=False, batch=None, batch_label=None, artist_lead=None, track_no=None,
-             commit=True, bulk=False):
+             commit=True, bulk=False, match_album=False):
     """Register a wanted song. Returns (id, created).
 
     Unless ``allow_dup``, an addition whose recording is already on disk is recorded as already
@@ -550,6 +732,12 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
     ``bulk`` marks a want that came in with many others. Asking again one at a time for something
     already wanted in bulk clears the mark, so the second, deliberate ask is not left waiting
     behind the list the first one arrived in.
+
+    ``match_album`` is for a song added on its own (the API's track add, the Add form). Its album
+    is the catalogue's label for whichever edition that catalogue listed, so it is matched against
+    the albums this artist already has (``canonical_album``) and joins the one that is the same
+    record. The album and artist adds leave it off: they file from one release's own listing, and
+    keep a deluxe edition apart on purpose.
     """
     # Wants are keyed on the STRICT title. norm() strips parentheticals, which would make
     # "Song" and "Song (live)" the same want and silently refuse the second — they are different
@@ -574,15 +762,22 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
             return _unbulk(conn, twin["id"], bulk, commit), False
     have = None if allow_dup else (find_exact(conn, artist, title, duration)
                                    or find_recording(conn, artist, title, duration))
+    if match_album and album:
+        matched_album, matched_year = canonical_album(conn, artist_lead, album, year)
+        if album_spelling(matched_album) != album_spelling(album):
+            # Another edition: the catalogue's position is on the one it listed, not this one.
+            track_no = None
+        album, year = matched_album, matched_year
+    lead_display = folder_display(conn, artist_lead) or lead_display_for(artist, artist_lead)
     cur = conn.execute(
         "INSERT INTO wants (artist,title,norm_artist,norm_title,album,year,duration,track_no,"
         "requested_by,requested_at,status,file_path,allow_dup,note,batch,batch_label,artist_lead,"
-        "bulk) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "bulk,lead_display) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (artist, title, na, nt, album, year, duration, track_no, requested_by, time.time(),
          STATUS_HAVE if have else STATUS_PENDING, have["path"] if have else None,
          1 if allow_dup else 0,
          "already on disk" if have else ("extra copy requested" if allow_dup else None),
-         batch, batch_label, artist_lead, 1 if bulk else 0))
+         batch, batch_label, artist_lead, 1 if bulk else 0, lead_display))
     if commit:
         conn.commit()
     return cur.lastrowid, True

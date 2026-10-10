@@ -220,6 +220,34 @@ check(status_of(api.search, q="  ", unit="track", limit=5, key=KEY,
       "even when there is nothing to search for")
 api.catalog.get = real_get
 
+# --- a song added on its own joins the album its artist already has ------------
+first = api.add(unit="track", artist="Gregory Porter", title="Holding On",
+                album="Take Me To The Alley", key=KEY, requested_by="listener", bulk=True)
+second = api.add(unit="track", artist="Gregory Porter", title="Insanity",
+                 album="Take Me to the Alley (Deluxe)", key=KEY, requested_by="listener",
+                 bulk=True)
+conn = db.connect()
+labels = {row["title"]: row["album"] for row in conn.execute(
+    "SELECT title, album FROM wants WHERE artist='Gregory Porter'")}
+conn.close()
+check(labels == {"Holding On": "Take Me To The Alley", "Insanity": "Take Me To The Alley"},
+      f"a track add files under the album already wanted, whatever edition it was listed on: {labels}")
+check(first.get("inLibrary") is False and first["message"] == "Added.",
+      f"a track not on disk says so: {first}")
+
+conn = db.connect()
+db.upsert_file(conn, {"path": "/music/Held Act/Album/01 - On Disk.flac", "artist": "Held Act",
+                      "album": "Album", "title": "On Disk", "file_title": "On Disk",
+                      "tag_title": "On Disk", "norm_artist": db.norm("Held Act"),
+                      "norm_title": db.norm("On Disk"), "norm_file": db.norm("On Disk"),
+                      "duration": 200.0})
+conn.commit()
+conn.close()
+owned = api.add(unit="track", artist="Held Act", title="On Disk", duration=200.0, key=KEY,
+                requested_by="listener", bulk=True)
+check(owned.get("inLibrary") is True and owned["message"] == "Already in the library.",
+      f"a track already on disk is reported as in the library, so nothing is charged for it: {owned}")
+
 shutil.rmtree(_scratch, ignore_errors=True)
 
 for failure in failures:

@@ -234,15 +234,24 @@ def add(unit: str, ref: str = "", source: str = "deezer", artist: str = "",
             if not artist.strip() or not title.strip():
                 raise HTTPException(
                     status_code=400, detail="A track needs an artist and a title.")
+            # One song with its catalogue's album label: matched to an album this artist already
+            # has, so a list imported song by song does not become one directory per edition.
             want_id, created = db.add_want(
                 conn, artist.strip(), title.strip(), album.strip() or None,
-                year.strip() or None, duration, requested_by or None, bulk=bulk)
+                year.strip() or None, duration, requested_by or None, bulk=bulk,
+                match_album=True)
             db.log_event(conn, "added" if created else "already-wanted",
                          f"{artist} - {title}", requested_by or "api")
+            row = conn.execute("SELECT status FROM wants WHERE id=?", (want_id,)).fetchone()
+            # A new want for a recording already on disk is recorded as had, and nothing is
+            # fetched. Said, so a caller charging for asks does not charge for this one.
+            in_library = bool(row) and row["status"] == db.STATUS_HAVE
             _nudge()
             return {"version": API_VERSION, "ok": True, "unit": unit,
                     "reference": f"want:{want_id}", "created": created,
-                    "message": ("Added." if created else "Already on the list.")}
+                    "inLibrary": in_library,
+                    "message": ("Already in the library." if in_library
+                                else "Added." if created else "Already on the list.")}
 
         if not ref.strip():
             raise HTTPException(

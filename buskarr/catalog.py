@@ -600,8 +600,16 @@ def merge_tracks(results):
                 cur["sources"].append(t["source"])
             cur["rank"] = min(cur["rank"], i)
             # Keep whichever copy carries the most usable metadata.
-            for field in ("duration", "album", "year", "image"):
+            for field in ("duration", "image"):
                 if not cur.get(field) and t.get(field):
                     cur[field] = t[field]
+            # Album and year describe ONE release, so they are taken from one catalogue, never
+            # one each: Deezer's "... (2016 Remaster)" with iTunes' 1982 named a release that does
+            # not exist, and a song filed by it lands beside, not inside, the album it belongs to.
+            if not cur.get("album") and t.get("album"):
+                cur["album"], cur["year"] = t["album"], t.get("year")
+            elif (not cur.get("year") and t.get("year") and t.get("album")
+                  and db.album_spelling(t["album"]) == db.album_spelling(cur["album"])):
+                cur["year"] = t["year"]
     # Relevance first; agreement across catalogues breaks ties in its favour.
     return sorted(merged.values(), key=lambda t: (t["rank"], -len(t["sources"])))
