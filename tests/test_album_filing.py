@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mutagen.flac import FLAC  # noqa: E402
 
-from buskarr import albums, db, repair, scan, worker  # noqa: E402
+from buskarr import albums, credit, db, repair, scan, worker  # noqa: E402
 
 FLAC_SILENCE = base64.b64decode(
     "ZkxhQwAAACICQAJAAAANAAANAfQA8AAAAZBrQxvy2nyTErPlwh5n9lkbBAAALAwAAABMYXZmNjEuNy4xMDMB"
@@ -373,6 +373,65 @@ try:
     check("and never the other way", not any(src == "AC_DC" for src, _ in pairs), str(pairs))
     for top in ("AC_DC", "AC-DC"):
         shutil.rmtree(os.path.join(LIB, top), ignore_errors=True)
+
+    print("\n=== a guest named in the title is the same song as one named in the credit ===")
+    conn, d = fresh()
+
+    def on_disk(artist, title, duration):
+        db.upsert_file(conn, {"path": f"{LIB}/{artist}/{title}.m4a", "artist": artist,
+                              "title": title, "file_title": title, "duration": duration,
+                              "codec": "aac", "artist_lead": worker.safe(artist.split(" feat")[0])})
+        conn.commit()
+        return f"{LIB}/{artist}/{title}.m4a"
+
+    def asked(artist, title, duration):
+        wid, created = db.add_want(conn, artist, title, None, None, duration, "defender",
+                                   match_album=True)
+        return wid, created, conn.execute("SELECT status, file_path FROM wants WHERE id=?",
+                                          (wid,)).fetchone()
+
+    held_at = on_disk("Classified", "Good News (feat. Breagh Isabel)", 206.911)
+    _, created, row = asked("Classified feat. Breagh Isabel", "Good News", 206.911)
+    check("a song held with the guest in its title is already on disk for a credit naming them",
+          row["status"] == db.STATUS_HAVE and row["file_path"] == held_at, str(dict(row)))
+    first, _, _ = asked("yetep", "Hate It When It's You (feat. Trella)", 229.0)
+    again, created, _ = asked("yetep feat. Trella", "Hate It When It\u2019s You", 229.846)
+    check("and a waiting want is the same want, curly apostrophe and all",
+          again == first and not created, f"{again} vs {first}, created={created}")
+    first, _, _ = asked("Crusher-P & dj-Jo", "ECHO (feat. Gumi) [dj-Jo Remix]", 236.571)
+    again, created, _ = asked("Crusher-P & dj-Jo feat. GUMI", "ECHO (dj-Jo remix)", 236.571)
+    check("with the remix named in brackets either way", again == first and not created,
+          f"{again} vs {first}, created={created}")
+    first, _, _ = asked("Luis Fonsi & Daddy Yankee", "Despacito", 228.0)
+    other, created, _ = asked("Luis Fonsi & Daddy Yankee", "Despacito (feat. Justin Bieber)", 229.0)
+    check("a guest only one side names is another song", created and other != first)
+    first, _, _ = asked("Act feat. Xavier", "Song", 200.0)
+    other, created, _ = asked("Act", "Song (feat. Yolanda)", 200.0)
+    check("and so is a different guest", created and other != first)
+    first, _, _ = asked("Act feat. Zed", "Longer Song", 200.0)
+    other, created, _ = asked("Act", "Longer Song (feat. Zed)", 240.0)
+    check("and lengths that disagree are another take", created and other != first)
+    on_disk("Queen Tribute Band", "Bohemian Rhapsody (Remastered)", 354.0)
+    _, _, row = asked("Queen", "Bohemian Rhapsody", 354.0)
+    check("a tribute act's file never stands in for the artist's song", row["status"] == db.STATUS_PENDING,
+          row["status"])
+    first, _, _ = asked("Act", "Tune feat. Guest", 180.0)
+    again, created, _ = asked("Act feat. Guest", "Tune", 180.0)
+    check("a guest named after the title without brackets counts too",
+          again == first and not created, f"{again} vs {first}, created={created}")
+    first, _, _ = asked("Band feat. Bea & Al", "Duet", 190.0)
+    again, created, _ = asked("Band", "Duet (feat. Al and Bea)", 190.0)
+    check("the same guests named in another order are the same guests",
+          again == first and not created, f"{again} vs {first}, created={created}")
+    check("a marker opening a name is not a guest",
+          credit.credit_guests("Ft. Lauderdale Band") == []
+          and credit.title_guests("Ft. Worth Blues") == ("Ft. Worth Blues", []))
+    held_at = on_disk("Said the Sky feat. Melissa Hayes", "Disciple", 231.0)
+    _, _, row = asked("Said The Sky", "Disciple", 231.0)
+    check("a file held under a kin credit with the same title is already on disk",
+          row["status"] == db.STATUS_HAVE and row["file_path"] == held_at, str(dict(row)))
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
 
     print("\n=== fold never folds a directory into itself ===")
     from buskarr import fold

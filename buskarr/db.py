@@ -637,8 +637,8 @@ def find_want_twin(conn, artist, title, duration, exclude=None):
         # Same title under a kin credit is the same recording too when the lengths agree: one list
         # credited "Said The Sky" and another "Said the Sky feat. Melissa Hayes" for one "Disciple",
         # the exact key differs on the credit, and the song was about to be fetched twice.
-        if _same_recording(title, r["title"], duration, r["duration"]) \
-                and _credit_kin(artist, r["artist"]):
+        if _credit_kin(artist, r["artist"]) \
+                and _same_song(artist, title, duration, r["artist"], r["title"], r["duration"]):
             return r
     return None
 
@@ -655,11 +655,50 @@ def find_recording(conn, artist, title, duration):
         f"SELECT * FROM files WHERE {_KIN_SQL}",
         {"na": norm(artist), "lead": folder_key(_lead(artist))}).fetchall()
     for r in rows:
+        # _KIN_SQL only narrows: its prefix match lets "Queen Tribute Band" through for "Queen".
+        if not _credit_kin(artist, r["artist"]):
+            continue
         for cand in (r["file_title"], r["title"]):
-            if cand and strict_norm(cand) != strict_norm(title) \
-                    and _same_recording(title, cand, duration, r["duration"]):
+            if not cand:
+                continue
+            if strict_norm(cand) == strict_norm(title) and r["norm_artist"] == norm(artist):
+                continue      # find_exact's case
+            # An equal title under another kin credit is the same recording when the lengths
+            # agree, as in find_want_twin: skipping every equal title left a file held as "Said the
+            # Sky feat. Melissa Hayes - Disciple" invisible to an add credited "Said The Sky".
+            if _same_song(artist, title, duration, r["artist"], cand, r["duration"]):
                 return r
     return None
+
+
+def _guest_moved(artist_a, title_a, artist_b, title_b):
+    """Both titles with their featuring segments taken out, when the two name the same guests,
+    one in its title and the other in its credit; else None.
+
+    Apple's catalogue lists "Classified - Good News (feat. Breagh Isabel)" for the record others
+    list as "Classified feat. Breagh Isabel - Good News". No edition label explains the difference,
+    so one import asked for three songs already held (2026-10-10). The guests must be the same
+    people: "Song (feat. X)" against a plain "Song" is a guest added, which may be another take.
+    """
+    from . import credit
+    bare_a, in_title_a = credit.title_guests(title_a)
+    bare_b, in_title_b = credit.title_guests(title_b)
+    if not in_title_a and not in_title_b:
+        return None
+    guests_a = {credit._loose(g) for g in in_title_a + credit.credit_guests(artist_a)}
+    guests_b = {credit._loose(g) for g in in_title_b + credit.credit_guests(artist_b)}
+    if guests_a != guests_b:
+        return None
+    return bare_a, bare_b
+
+
+def _same_song(artist_a, title_a, dur_a, artist_b, title_b, dur_b):
+    """``_same_recording``, also across a guest named in the title on one side and the credit on
+    the other (``_guest_moved``)."""
+    if _same_recording(title_a, title_b, dur_a, dur_b):
+        return True
+    moved = _guest_moved(artist_a, title_a, artist_b, title_b)
+    return bool(moved) and _same_recording(moved[0], moved[1], dur_a, dur_b)
 
 
 def _lead(artist):
