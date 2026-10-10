@@ -247,6 +247,25 @@ try:
     conn.close()
     shutil.rmtree(d, ignore_errors=True)
 
+    print("\n=== fold tags a folded duet with its lead's display spelling ===")
+    from buskarr import fold
+    conn, d = fresh()
+    held(conn, "AC/DC", "Thunderstruck", "The Razors Edge", "1990")
+    duet_dir = os.path.join(LIB, "AC_DC & Someone", "A Single")
+    os.makedirs(duet_dir, exist_ok=True)
+    duet = os.path.join(duet_dir, "Duet.flac")
+    with open(duet, "wb") as fh:
+        fh.write(FLAC_SILENCE)
+    fold.fold(conn, root=LIB, dry_run=False, log=lambda *a: None)
+    folded = os.path.join(LIB, "AC_DC", "A Single", "Duet.flac")
+    check("the duet folder folded into the lead's", os.path.exists(folded) and not os.path.exists(duet))
+    check("and its albumartist is the lead as spelled, not the directory",
+          os.path.exists(folded) and FLAC(folded).get("albumartist") == ["AC/DC"],
+          str(FLAC(folded).get("albumartist")) if os.path.exists(folded) else "missing")
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
+    shutil.rmtree(os.path.join(LIB, "AC_DC"), ignore_errors=True)
+
     print("\n=== the repair rule writes the display spelling ===")
     dirs = {"AC_DC", "Jonathan Coulton", "Moon Hooch"}
     check("AC_DC becomes AC/DC",
