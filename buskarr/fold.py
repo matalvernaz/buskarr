@@ -139,7 +139,8 @@ def fold(conn, root=LIBRARY, dry_run=True, log=print):
                     collisions += 1
                 # The lead belongs in the tags too: a media server builds its artist list from tags,
                 # not from directory names, so moving the file alone would not group anything.
-                repair.write_tags(final, album_artist=lead)
+                # Its display spelling, not the directory's: "AC_DC" is not an artist.
+                repair.write_tags(final, album_artist=db.folder_display(conn, lead) or lead)
                 conn.execute("DELETE FROM files WHERE path=?", (old,))
                 # Re-point the want as well. Leaving it stale meant a refile run before the next
                 # rescan saw a file_path that no longer existed and skipped the track entirely.
