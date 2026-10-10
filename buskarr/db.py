@@ -629,8 +629,11 @@ def find_want_twin(conn, artist, title, duration, exclude=None):
     for r in rows:
         if exclude and r["id"] == exclude:
             continue
-        if strict_norm(r["title"]) == strict_norm(title):
+        if strict_norm(r["title"]) == strict_norm(title) and r["norm_artist"] == norm(artist):
             continue          # the exact key already covers this; not an edition variant
+        # Same title under a kin credit is the same recording too when the lengths agree: one list
+        # credited "Said The Sky" and another "Said the Sky feat. Melissa Hayes" for one "Disciple",
+        # the exact key differs on the credit, and the song was about to be fetched twice.
         if _same_recording(title, r["title"], duration, r["duration"]) \
                 and _credit_kin(artist, r["artist"]):
             return r
@@ -798,14 +801,28 @@ def existing_lead(conn, artist):
     feat. The Longest Johns", where they are the guest, does not join them, and "Simon &
     Garfunkel" stays itself unless a directory named "Simon" exists. The longest lead wins.
     Compared on each directory's display spelling, since "AC/DC & X" does not start with "AC_DC".
+    A lead that is an existing directory spelled differently ("Said the Sky" for "Said The Sky")
+    joins it too.
     """
     from . import credit
-    names = {}
-    for r in conn.execute("SELECT DISTINCT artist_lead, lead_display FROM wants "
-                          "WHERE artist_lead IS NOT NULL"):
+    names, used = {}, collections.Counter()
+    for r in conn.execute("SELECT artist_lead, lead_display, COUNT(*) n FROM wants "
+                          "WHERE artist_lead IS NOT NULL GROUP BY artist_lead, lead_display"):
         names.setdefault(r["artist_lead"], r["lead_display"] or r["artist_lead"])
-    for r in conn.execute("SELECT DISTINCT artist_lead FROM files WHERE artist_lead IS NOT NULL"):
+        used[r["artist_lead"]] += r["n"]
+    for r in conn.execute("SELECT artist_lead, COUNT(*) n FROM files WHERE artist_lead IS NOT NULL "
+                          "GROUP BY artist_lead"):
         names.setdefault(r["artist_lead"], r["artist_lead"])
+        used[r["artist_lead"]] += r["n"]
+    # The same artist spelled another way first: "Said the Sky" when "Said The Sky" is already
+    # a directory made a second one, differing only in case. Taken when the guessed directory
+    # does not exist itself; the busiest spelling wins.
+    guess = credit.lead_artist(artist)
+    if folder_key(guess) not in names:
+        same = [folder for folder, shown in names.items()
+                if credit._loose(shown) and credit._loose(shown) == credit._loose(guess)]
+        if same:
+            return max(same, key=lambda f: (used[f], f))
     whole = credit._loose(artist)
     found = [(folder, shown) for folder, shown in names.items()
              if credit._loose(shown) != whole and credit.credited_to(artist, shown)]
