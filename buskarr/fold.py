@@ -95,8 +95,13 @@ def _adopt_wants(conn, src_name, lead):
     n = 0
     for w in conn.execute("SELECT id, artist, artist_lead FROM wants").fetchall():
         if worker.safe(worker.folder_artist(w)) == src_name:
-            conn.execute("UPDATE wants SET artist_lead=? WHERE id=?", (lead, w["id"]))
+            # The display spelling belonged to the old directory; the backfill gives each moved
+            # want the one its new directory uses.
+            conn.execute("UPDATE wants SET artist_lead=?, lead_display=NULL WHERE id=?",
+                         (lead, w["id"]))
             n += 1
+    if n:
+        db.backfill_lead_display(conn)
     return n
 
 

@@ -627,7 +627,7 @@ def create_want(request: Request, artist: str = Form(...), title: str = Form(...
     except ValueError:
         dur = None
     wid, created = db.add_want(conn, artist, title, album or None, year or None, dur,
-                              user_of(request), allow_dup=bool(allow_dup))
+                              user_of(request), allow_dup=bool(allow_dup), match_album=True)
     db.log_event(conn, "added" if created else "already-wanted",
                  f"{artist} - {title}", user_of(request))
     row = conn.execute("SELECT status FROM wants WHERE id=?", (wid,)).fetchone()

@@ -234,9 +234,12 @@ def add(unit: str, ref: str = "", source: str = "deezer", artist: str = "",
             if not artist.strip() or not title.strip():
                 raise HTTPException(
                     status_code=400, detail="A track needs an artist and a title.")
+            # One song with its catalogue's album label: matched to an album this artist already
+            # has, so a list imported song by song does not become one directory per edition.
             want_id, created = db.add_want(
                 conn, artist.strip(), title.strip(), album.strip() or None,
-                year.strip() or None, duration, requested_by or None, bulk=bulk)
+                year.strip() or None, duration, requested_by or None, bulk=bulk,
+                match_album=True)
             db.log_event(conn, "added" if created else "already-wanted",
                          f"{artist} - {title}", requested_by or "api")
             _nudge()

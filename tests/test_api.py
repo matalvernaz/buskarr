@@ -220,6 +220,19 @@ check(status_of(api.search, q="  ", unit="track", limit=5, key=KEY,
       "even when there is nothing to search for")
 api.catalog.get = real_get
 
+# --- a song added on its own joins the album its artist already has ------------
+first = api.add(unit="track", artist="Gregory Porter", title="Holding On",
+                album="Take Me To The Alley", key=KEY, requested_by="listener", bulk=True)
+second = api.add(unit="track", artist="Gregory Porter", title="Insanity",
+                 album="Take Me to the Alley (Deluxe)", key=KEY, requested_by="listener",
+                 bulk=True)
+conn = db.connect()
+labels = {row["title"]: row["album"] for row in conn.execute(
+    "SELECT title, album FROM wants WHERE artist='Gregory Porter'")}
+conn.close()
+check(labels == {"Holding On": "Take Me To The Alley", "Insanity": "Take Me To The Alley"},
+      f"a track add files under the album already wanted, whatever edition it was listed on: {labels}")
+
 shutil.rmtree(_scratch, ignore_errors=True)
 
 for failure in failures:

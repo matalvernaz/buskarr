@@ -115,6 +115,22 @@ def folder_artist(want):
     return credit.lead_artist(want["artist"], dict(want).get("artist_lead"))
 
 
+def album_artist(want):
+    """The albumartist tag: the lead as the catalogue spells it, not as its directory has to.
+
+    ``folder_artist`` is the directory form once a lead has been stored, and ``safe()`` rewrites
+    "/" and drops trailing full stops, so tagging with it gave Jellyfin an "AC_DC" and a
+    "Wheeler Walker Jr" beside the "AC/DC" and "Wheeler Walker Jr." in the track credits. The want's
+    ``lead_display`` is the directory's one agreed spelling; it is trusted only while it still
+    names the same directory, since a fold can move a want to another lead after it was set.
+    """
+    folder = safe(folder_artist(want))
+    shown = dict(want).get("lead_display")
+    if shown and safe(shown) == folder:
+        return shown
+    return db.lead_display_for(want["artist"], folder)
+
+
 def want_track(want, fallback=None):
     """The track number to name and tag a want's file with: the want's own, else ``fallback``.
 
@@ -275,7 +291,7 @@ def tag(path, want, track=None):
     """
     track = want_track(want, track)
     ext = os.path.splitext(path)[1].lower()
-    lead = folder_artist(want)
+    lead = album_artist(want)
     numbered = bool(want["album"]) and bool(track)
     try:
         if ext in (".flac", ".opus"):
