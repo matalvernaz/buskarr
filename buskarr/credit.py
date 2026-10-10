@@ -119,3 +119,35 @@ def lead_artist(full_credit, known_lead=None):
     head = _FEAT.split(full_credit or "", 1)[0].strip(" -–,([")
     # A credit that is *nothing but* a featuring marker ("Ft. Lauderdale Band") trims to empty.
     return head or (full_credit or "")
+
+
+# A featuring segment inside a TITLE: "Good News (feat. Breagh Isabel)", "ECHO (feat. Gumi) [dj-Jo
+# Remix]", "Song feat. X" at the end. Apple's catalogue names guests in the title where most others
+# name them in the credit. A marker at the very start ("Ft. Worth Blues") is not one.
+_TITLE_FEAT = re.compile(
+    r"\s*[(\[]\s*(?:feat|feats|ft|featuring)\b\.?\s+([^)\]]+)[)\]]"
+    r"|\s+(?:feat|feats|ft|featuring)\b\.?\s+([^(\[]+?)\s*$", re.IGNORECASE)
+_GUESTS = re.compile(r"\s*(?:,|&|\+|\band\b)\s*", re.IGNORECASE)
+
+
+def title_guests(title):
+    """``title`` without its featuring segment, and the guests that segment named.
+
+    "Good News (feat. Breagh Isabel)" gives ("Good News", ["Breagh Isabel"]). A title naming no
+    guest comes back unchanged with an empty list.
+    """
+    title = title or ""
+    m = _TITLE_FEAT.search(title)
+    if not m:
+        return title, []
+    bare = (title[:m.start()] + title[m.end():]).strip()
+    return bare, [g for g in _GUESTS.split(m.group(1) or m.group(2)) if g.strip()]
+
+
+def credit_guests(full_credit):
+    """The guests a credit names after its featuring marker: "Breagh Isabel" for "Classified feat.
+    Breagh Isabel". None when no marker follows a lead ("Ft. Lauderdale Band" is a band)."""
+    parts = _FEAT.split(full_credit or "", 1)
+    if len(parts) < 2 or not parts[0].strip(" -–,(["):
+        return []
+    return [g for g in _GUESTS.split(parts[1].strip(" )]")) if g.strip()]
