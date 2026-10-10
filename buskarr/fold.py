@@ -53,7 +53,7 @@ def plan(root):
     # to ITSELF, and the fold then "moved" its files onto their own names, suffixing them "(2)".
     by_name = collections.defaultdict(list)
     for d in dirs:
-        by_name[credit._loose(d) or credit._fallback(d)].append(d)
+        by_name[credit.spelling(d)].append(d)
     direct = {}
     for group in by_name.values():
         if len(group) > 1:
@@ -63,7 +63,7 @@ def plan(root):
         if d in direct:
             continue
         parents = [p for p in dirs if p != d and p not in direct
-                   and credit._loose(p) != credit._loose(d) and credit.credited_to(d, p)]
+                   and credit.spelling(p) != credit.spelling(d) and credit.credited_to(d, p)]
         if parents:
             direct[d] = max(parents, key=len)
     out = []

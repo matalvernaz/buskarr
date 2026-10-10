@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS grab_attempts (
 
 # Kept separate from the tables, and applied AFTER migrate(): files_normfile references
 # norm_file, a column added after the first release, so on an existing database this index
-# cannot be created until the ALTER has run.
+# cannot be created until the ALTER has run. The two lead indexes keep ``_lead_weights``, which
+# every add runs, an index scan rather than two table sorts.
 SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS files_norm ON files(norm_artist, norm_title);
 CREATE INDEX IF NOT EXISTS files_normfile ON files(norm_artist, norm_file);
@@ -137,6 +138,8 @@ CREATE INDEX IF NOT EXISTS files_artist ON files(artist);
 CREATE INDEX IF NOT EXISTS wants_status ON wants(status);
 CREATE INDEX IF NOT EXISTS events_at ON events(at DESC);
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS wants_lead ON wants(artist_lead, lead_display);
+CREATE INDEX IF NOT EXISTS files_lead ON files(artist_lead);
 """
 
 JOB_QUEUED = "queued"
@@ -742,6 +745,9 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
     record; and a collaboration with no lead given files under the lead's existing directory
     (``existing_lead``). The album and artist adds leave it off: they file from one release's own
     listing, and keep a deluxe edition apart on purpose.
+
+    Whatever the path, a lead that is an existing directory's artist spelled another way files
+    into that directory (``spelled_lead``).
     """
     # Wants are keyed on the STRICT title. norm() strips parentheticals, which would make
     # "Song" and "Song (live)" the same want and silently refuse the second — they are different
@@ -757,6 +763,10 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
         # folder of its own ("Zedd & Alessia Cara") beside the lead's. fold's rule, applied as the
         # song arrives rather than after: the lead must already have a directory.
         artist_lead = existing_lead(conn, artist) or artist_lead
+    # Every path, not only the song-by-song ones: an album or artist add from a catalogue that
+    # spells the name "Marina and the Diamonds" otherwise starts a directory beside the
+    # "Marina and The Diamonds" another list already made.
+    artist_lead = spelled_lead(conn, artist_lead) or artist_lead
     na, nt = norm(artist), strict_norm(title)
     existing = conn.execute("SELECT id FROM wants WHERE norm_artist=? AND norm_title=?",
                             (na, nt)).fetchone()
@@ -793,6 +803,42 @@ def add_want(conn, artist, title, album=None, year=None, duration=None, requeste
     return cur.lastrowid, True
 
 
+def _lead_weights(conn):
+    """Every artist directory a want or a file names: {directory: display spelling}, plus how many
+    wants and files each holds (``used``) and how many files alone (``held``)."""
+    names, used, held = {}, collections.Counter(), collections.Counter()
+    for r in conn.execute("SELECT artist_lead, lead_display, COUNT(*) n FROM wants "
+                          "WHERE artist_lead IS NOT NULL GROUP BY artist_lead, lead_display"):
+        names.setdefault(r["artist_lead"], r["lead_display"] or r["artist_lead"])
+        used[r["artist_lead"]] += r["n"]
+    for r in conn.execute("SELECT artist_lead, COUNT(*) n FROM files WHERE artist_lead IS NOT NULL "
+                          "GROUP BY artist_lead"):
+        names.setdefault(r["artist_lead"], r["artist_lead"])
+        used[r["artist_lead"]] += r["n"]
+        held[r["artist_lead"]] += r["n"]
+    return names, used, held
+
+
+def spelled_lead(conn, lead, weights=None):
+    """The directory ``lead``'s artist already has under another spelling, else None.
+
+    "Said the Sky" made a second directory beside "Said The Sky", and "Howlin’ Wolf" with a curly
+    apostrophe would have made one beside "Howlin' Wolf": catalogues case and punctuate one name
+    differently. Spellings are compared as ``fold`` groups directories (``credit.spelling``). One
+    with files on disk beats one that is only asked for, then the busiest wins, so a song never
+    starts a twin of a directory that exists, and a spelling only waiting wants use gives way too.
+    ``lead`` is the directory form ``artist_lead`` stores.
+    """
+    from . import credit
+    key = credit.spelling(lead)
+    if not lead or not key:
+        return None
+    names, used, held = weights or _lead_weights(conn)
+    same = {folder for folder in names if credit.spelling(folder) == key} | {lead}
+    best = max(same, key=lambda f: (held[f], used[f], f))
+    return best if best != lead else None
+
+
 def existing_lead(conn, artist):
     """The artist directory a collaboration credit belongs in, when its lead already has one.
 
@@ -802,31 +848,21 @@ def existing_lead(conn, artist):
     Garfunkel" stays itself unless a directory named "Simon" exists. The longest lead wins.
     Compared on each directory's display spelling, since "AC/DC & X" does not start with "AC_DC".
     A lead that is an existing directory spelled differently ("Said the Sky" for "Said The Sky")
-    joins it too.
+    joins it too (``spelled_lead``).
     """
     from . import credit
-    names, used = {}, collections.Counter()
-    for r in conn.execute("SELECT artist_lead, lead_display, COUNT(*) n FROM wants "
-                          "WHERE artist_lead IS NOT NULL GROUP BY artist_lead, lead_display"):
-        names.setdefault(r["artist_lead"], r["lead_display"] or r["artist_lead"])
-        used[r["artist_lead"]] += r["n"]
-    for r in conn.execute("SELECT artist_lead, COUNT(*) n FROM files WHERE artist_lead IS NOT NULL "
-                          "GROUP BY artist_lead"):
-        names.setdefault(r["artist_lead"], r["artist_lead"])
-        used[r["artist_lead"]] += r["n"]
-    # The same artist spelled another way first: "Said the Sky" when "Said The Sky" is already
-    # a directory made a second one, differing only in case. Taken when the guessed directory
-    # does not exist itself; the busiest spelling wins.
-    guess = credit.lead_artist(artist)
-    if folder_key(guess) not in names:
-        same = [folder for folder, shown in names.items()
-                if credit._loose(shown) and credit._loose(shown) == credit._loose(guess)]
-        if same:
-            return max(same, key=lambda f: (used[f], f))
+    weights = _lead_weights(conn)
+    names = weights[0]
+    spelled = spelled_lead(conn, folder_key(credit.lead_artist(artist)), weights)
+    if spelled:
+        return spelled
     whole = credit._loose(artist)
     found = [(folder, shown) for folder, shown in names.items()
              if credit._loose(shown) != whole and credit.credited_to(artist, shown)]
-    return max(found, key=lambda f: len(f[1]))[0] if found else None
+    if not found:
+        return None
+    lead = max(found, key=lambda f: len(f[1]))[0]
+    return spelled_lead(conn, lead, weights) or lead
 
 
 def _unbulk(conn, want_id, bulk, commit):

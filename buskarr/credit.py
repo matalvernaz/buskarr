@@ -11,6 +11,7 @@ for both, so either guests leaked into the discography or genuine collaborations
 across a folder each. The full credit still reaches the ``artist`` tag either way — nothing here
 discards information, it only decides which name is the lead.
 """
+import functools
 import re
 import unicodedata
 
@@ -41,6 +42,17 @@ def _loose(s):
     s = unicodedata.normalize("NFKC", s or "").casefold()
     s = s.replace("&", " and ").replace("+", " and ")
     return " ".join(re.sub(r"[^\w]+", " ", s, flags=re.UNICODE).split())
+
+
+@functools.lru_cache(maxsize=8192)
+def spelling(name):
+    """The form two directory names share when they are one artist spelled two ways.
+
+    Case and punctuation only: "Said the Sky" and "Said The Sky", "Howlin’ Wolf" and "Howlin' Wolf",
+    "AC_DC", which is how a directory has to spell "AC/DC", and "AC-DC". ``fold`` groups directories
+    by it and ``db.spelled_lead`` files new wants by it, so the two agree on what is a twin.
+    """
+    return _loose((name or "").replace("_", " ")) or _fallback(name)
 
 
 def _fallback(s):

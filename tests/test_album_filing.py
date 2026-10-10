@@ -271,6 +271,109 @@ try:
     shutil.rmtree(d, ignore_errors=True)
     shutil.rmtree(os.path.join(LIB, "Said The Sky"), ignore_errors=True)
 
+    print("\n=== every add files under the directory the artist has, however a catalogue spells it ===")
+    conn, d = fresh()
+
+    def lead_of(wid):
+        return conn.execute("SELECT artist_lead, lead_display FROM wants WHERE id=?",
+                            (wid,)).fetchone()
+
+    def queued_before(conn, artist, title, spelt, duration):
+        """A want added before this rule, still carrying the catalogue's spelling."""
+        wid, _ = db.add_want(conn, artist, title, None, None, duration, "tester")
+        conn.execute("UPDATE wants SET artist_lead=?, lead_display=? WHERE id=?", (spelt, spelt, wid))
+        conn.commit()
+        return wid
+
+    for title in ("Primadonna", "Lies"):
+        scan.index_file(conn, LIB, held(conn, "Marina and The Diamonds", title, "Electra Heart",
+                                        "2012")[1])
+    wid, _ = db.add_want(conn, "Marina and the Diamonds", "Power & Control", "Electra Heart", "2012",
+                         225.0, "tester", batch="b1", batch_label="album")
+    w = lead_of(wid)
+    check("an album add spelling the name another way joins the existing directory",
+          w["artist_lead"] == "Marina and The Diamonds", w["artist_lead"])
+    check("and takes that directory's display spelling",
+          w["lead_display"] == "Marina and The Diamonds", w["lead_display"])
+    scan.index_file(conn, LIB, held(conn, "Howlin' Wolf", "Spoonful", "Howlin' Wolf", "1962")[1])
+    wid, _ = db.add_want(conn, "Howlin\u2019 Wolf", "Smokestack Lightnin'", "Moanin' in the Moonlight",
+                         "1959", 186.0, "tester", batch="b2", batch_label="artist",
+                         artist_lead="Howlin\u2019 Wolf")
+    check("so does an artist add whose catalogue lead has a curly apostrophe",
+          lead_of(wid)["artist_lead"] == "Howlin' Wolf", lead_of(wid)["artist_lead"])
+    queued_before(conn, "Howlin\u2019 Wolf", "Killing Floor", "Howlin\u2019 Wolf", 170.0)
+    wid, _ = db.add_want(conn, "Howlin\u2019 Wolf", "Evil", None, None, 175.0, "tester",
+                         match_album=True)
+    check("a spelling that only a waiting want uses is not a directory to join",
+          lead_of(wid)["artist_lead"] == "Howlin' Wolf", lead_of(wid)["artist_lead"])
+    scan.index_file(conn, LIB, held(conn, "Said The Sky", "Show & Tell", "Wide-Eyed", "2021")[1])
+    for i, title in enumerate(("Disciple", "Rush Over Me", "Treading Water")):
+        queued_before(conn, "Said the Sky", title, "Said the Sky", 200.0 + i)
+    wid, _ = db.add_want(conn, "Said the Sky", "Faith", "Faith", None, 210.0, "tester",
+                         match_album=True)
+    check("files on disk beat a spelling with more waiting wants",
+          lead_of(wid)["artist_lead"] == "Said The Sky", lead_of(wid)["artist_lead"])
+    scan.index_file(conn, LIB, held(conn, "AC/DC", "Back in Black", "Back in Black", "1980")[1])
+    wid, _ = db.add_want(conn, "AC-DC", "Hells Bells", "Back in Black", "1980", 312.0, "tester",
+                         batch="b3", batch_label="album")
+    check("a hyphen for the slash is the directory that has to spell it AC_DC",
+          lead_of(wid)["artist_lead"] == "AC_DC", lead_of(wid)["artist_lead"])
+    wid, _ = db.add_want(conn, "Marina", "Venus Fly Trap", "Ancient Dreams", "2021", 190.0, "tester",
+                         batch="b4", batch_label="album")
+    check("a name that only starts the same is another artist",
+          lead_of(wid)["artist_lead"] == "Marina", lead_of(wid)["artist_lead"])
+    scan.index_file(conn, LIB, held(conn, "Simon", "Rhymin", "There Goes Rhymin' Simon", "1973")[1])
+    wid, _ = db.add_want(conn, "Simon & Garfunkel", "The Boxer", "Bridge over Troubled Water",
+                         "1970", 308.0, "tester", batch="b5", batch_label="album")
+    check("and an album add still keeps a duo apart from a directory named for one of them",
+          lead_of(wid)["artist_lead"] == "Simon & Garfunkel", lead_of(wid)["artist_lead"])
+    blank = queued_before(conn, "Somebody", "Untitled", "", 99.0)
+    check("an empty lead is left alone, even beside a want whose lead is blank",
+          db.spelled_lead(conn, "") is None and db.spelled_lead(conn, None) is None)
+    conn.execute("DELETE FROM wants WHERE id=?", (blank,))
+    conn.commit()
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
+
+    conn, d = fresh()
+    for i, (spelt, n) in enumerate((("Marina and The Diamonds", 2), ("Marina and the Diamonds", 1))):
+        for j in range(n):
+            queued_before(conn, spelt, f"Song {i}{j}", spelt, 100.0 + 10 * i + j)
+    wid, _ = db.add_want(conn, "Marina and the Diamonds", "Song new", None, None, 150.0, "tester")
+    check("with nothing on disk yet, the spelling more wants use wins",
+          lead_of(wid)["artist_lead"] == "Marina and The Diamonds", lead_of(wid)["artist_lead"])
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
+    for top in ("Marina and The Diamonds", "Howlin' Wolf", "Said The Sky", "AC_DC", "Simon"):
+        shutil.rmtree(os.path.join(LIB, top), ignore_errors=True)
+
+    conn, d = fresh()
+    scan.index_file(conn, LIB, held(conn, "Said the Sky", "Disciple", "Faith", "2022")[1])
+    queued_before(conn, "Said The Sky", "Treading Water", "Said The Sky", 222.0)
+    check("existing_lead takes the spelling on disk over one only a waiting want uses",
+          db.existing_lead(conn, "Said The Sky") == "Said the Sky",
+          str(db.existing_lead(conn, "Said The Sky")))
+    check("and a duet's lead is that spelling too, whichever its credit matched first",
+          db.existing_lead(conn, "Said The Sky & Illenium") == "Said the Sky",
+          str(db.existing_lead(conn, "Said The Sky & Illenium")))
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
+    shutil.rmtree(os.path.join(LIB, "Said the Sky"), ignore_errors=True)
+
+    print("\n=== fold groups spellings the way new wants are filed ===")
+    from buskarr import fold
+    for rel in ("AC_DC/Back in Black (1980)/01 - Hells Bells.flac",
+                "AC_DC/Back in Black (1980)/06 - Back in Black.flac",
+                "AC-DC/Highway to Hell/01 - Highway to Hell.flac"):
+        os.makedirs(os.path.dirname(os.path.join(LIB, rel)), exist_ok=True)
+        with open(os.path.join(LIB, rel), "wb") as fh:
+            fh.write(FLAC_SILENCE)
+    pairs = fold.plan(LIB)
+    check("a hyphenated twin of a slash name folds into it", ("AC-DC", "AC_DC") in pairs, str(pairs))
+    check("and never the other way", not any(src == "AC_DC" for src, _ in pairs), str(pairs))
+    for top in ("AC_DC", "AC-DC"):
+        shutil.rmtree(os.path.join(LIB, top), ignore_errors=True)
+
     print("\n=== fold never folds a directory into itself ===")
     from buskarr import fold
     root = LIB
