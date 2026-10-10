@@ -559,8 +559,10 @@ def canonical_album(conn, artist_lead, album, year=None):
 
     An album this artist already has that is the same record (``album_fold``) wins over the
     catalogue's label for it, so the song joins the directory its album-mates are in instead of
-    starting another. The match is only within one artist's directory, and two known years more than
-    one apart are different releases that happen to share a name.
+    starting another. The match is only within one artist's directory. Two albums spelled the same
+    whose known years are more than one apart are different releases that share a name — four of
+    Peter Gabriel's are called "Peter Gabriel" — while an edition's later year is expected: "(2011
+    Remaster)" came out in 2011, and is still the 1988 album.
 
     When several albums already fold to the same record, an edition spelled exactly as asked is
     taken — an artist add keeps a deluxe edition apart on purpose, and a song from it belongs
@@ -582,7 +584,8 @@ def canonical_album(conn, artist_lead, album, year=None):
         if album_fold(r["album"]) != key:
             continue
         their_year = _year4(r["year"])
-        if asked_year and their_year and abs(int(asked_year) - int(their_year)) > 1:
+        if (asked_year and their_year and abs(int(asked_year) - int(their_year)) > 1
+                and album_spelling(r["album"]) == album_spelling(album)):
             continue
         found.append(r)
     if not found:

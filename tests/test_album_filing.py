@@ -129,6 +129,32 @@ try:
     check("two known years far apart are different releases", got == ("Sandwich", "2016"), str(got))
     got = db.canonical_album(conn, "Psychostick", "Sandwich", "2010")
     check("a year either side is the same release", got == ("Sandwich", "2009"), str(got))
+    held(conn, "The Proclaimers", "Letter From America", "Sunshine on Leith", "1988")
+    got = db.canonical_album(conn, "The Proclaimers", "Sunshine on Leith (2011 Remaster)", "2011")
+    check("an edition's later year does not keep it out of the original",
+          got == ("Sunshine on Leith", "1988"), str(got))
+    held(conn, "Peter Gabriel", "Solsbury Hill", "Peter Gabriel", "1977")
+    got = db.canonical_album(conn, "Peter Gabriel", "Peter Gabriel", "1980")
+    check("but the same name years apart is another album (Peter Gabriel 1 and 3)",
+          got == ("Peter Gabriel", "1980"), str(got))
+
+    print("\n=== a search row takes album and year from one catalogue ===")
+    from buskarr import catalog
+    deezer = [{"source": "deezer", "artist": "Phil Collins", "title": "Thru These Walls",
+               "duration": 302, "album": "Hello, I Must Be Going! (2016 Remaster)"}]
+    itunes = [{"source": "itunes", "artist": "Phil Collins", "title": "Thru These Walls",
+               "duration": 302, "album": "Hello, I Must Be Going!", "year": "1982"}]
+    row = catalog.merge_tracks([deezer, itunes])[0]
+    check("another catalogue's year for another edition is not borrowed",
+          (row["album"], row.get("year")) == ("Hello, I Must Be Going! (2016 Remaster)", None),
+          str((row["album"], row.get("year"))))
+    itunes_same = [dict(itunes[0], album="hello, i must be going! (2016 remaster)", year="2016")]
+    row = catalog.merge_tracks([deezer, itunes_same])[0]
+    check("the same album's year is", row.get("year") == "2016", str(row.get("year")))
+    bare = [dict(deezer[0], album="")]
+    row = catalog.merge_tracks([bare, itunes])[0]
+    check("a row with no album takes album and year together",
+          (row["album"], row.get("year")) == ("Hello, I Must Be Going!", "1982"))
 
     print("\n=== only the song-by-song paths match ===")
     wid, _ = db.add_want(conn, "Phil Collins", "I Missed Again", "Hello, I Must Be Going (Deluxe)",
@@ -220,13 +246,16 @@ try:
     held(conn, "Taylor Swift", "Anti-Hero", "Midnights (Deluxe)", "2022", batch="b1")
     held(conn, "Taylor Swift", "Lavender Haze", "Midnights", "2022", batch="b1")
     held(conn, "Psychostick", "Beer", "Sandwich", "2003")
-    held(conn, "Psychostick", "Numbers", "Sandwich (Deluxe)", "2009")
+    held(conn, "Psychostick", "Numbers", "Sandwich", "2009")
+    held(conn, "The Proclaimers", "500 Miles", "Sunshine on Leith", "1988")
+    held(conn, "The Proclaimers", "Sky Takes the Soul", "Sunshine on Leith (2011 Remaster)", "2011")
     groups, skipped = albums.plan(conn)
     leads = {g["lead"] for g in groups}
     check("the song-by-song split is planned", "Fleetwood Mac" in leads, str(leads))
     check("an artist add's editions are left apart", "Taylor Swift" not in leads)
-    check("years far apart are reported, not merged",
+    check("the same name years apart is reported, not merged",
           any(s[0] == "Psychostick" for s in skipped) and "Psychostick" not in leads)
+    check("an edition with its own later year is still brought in", "The Proclaimers" in leads)
     g = next(g for g in groups if g["lead"] == "Fleetwood Mac")
     check("it settles on the spelling most songs already use",
           g["settled"] == ("Greatest Hits", None), str(g["settled"]))

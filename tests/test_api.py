@@ -232,6 +232,21 @@ labels = {row["title"]: row["album"] for row in conn.execute(
 conn.close()
 check(labels == {"Holding On": "Take Me To The Alley", "Insanity": "Take Me To The Alley"},
       f"a track add files under the album already wanted, whatever edition it was listed on: {labels}")
+check(first.get("inLibrary") is False and first["message"] == "Added.",
+      f"a track not on disk says so: {first}")
+
+conn = db.connect()
+db.upsert_file(conn, {"path": "/music/Held Act/Album/01 - On Disk.flac", "artist": "Held Act",
+                      "album": "Album", "title": "On Disk", "file_title": "On Disk",
+                      "tag_title": "On Disk", "norm_artist": db.norm("Held Act"),
+                      "norm_title": db.norm("On Disk"), "norm_file": db.norm("On Disk"),
+                      "duration": 200.0})
+conn.commit()
+conn.close()
+owned = api.add(unit="track", artist="Held Act", title="On Disk", duration=200.0, key=KEY,
+                requested_by="listener", bulk=True)
+check(owned.get("inLibrary") is True and owned["message"] == "Already in the library.",
+      f"a track already on disk is reported as in the library, so nothing is charged for it: {owned}")
 
 shutil.rmtree(_scratch, ignore_errors=True)
 

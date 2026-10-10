@@ -17,8 +17,9 @@ match. Moving and retagging in one step would change the key on the way and lose
 
 Only groups holding at least one song-by-song want (``batch IS NULL``) are touched. An artist or
 album add files from one release's own listing and keeps a deluxe edition apart on purpose; those
-directories stay as they are. A group whose known years are more than one apart is two releases
-that share a name, and is reported rather than merged.
+directories stay as they are. Albums spelled the same but dated more than a year apart are two
+releases that share a name, and their group is reported rather than merged; an edition's later
+year ("(2011 Remaster)") is expected and does not count.
 """
 import collections
 import json
@@ -28,6 +29,16 @@ import time
 from . import db, refile, repair, scan, worker
 
 LIBRARY = os.environ.get("LIBRARY_DIR", "/music")
+
+
+def _same_name_far_apart(members):
+    """Two wants spelling the album the same, dated more than a year apart: two releases."""
+    years = collections.defaultdict(set)
+    for w in members:
+        y = db._year4(w["year"])
+        if y:
+            years[db.album_spelling(w["album"])].add(int(y))
+    return any(max(ys) - min(ys) > 1 for ys in years.values())
 
 
 def _choice_key(stats, album):
@@ -59,8 +70,7 @@ def plan(conn, artist=None):
             continue
         if not any(w["batch"] is None for w in members):
             continue                        # an artist or album add's editions, kept apart on purpose
-        years = {int(y) for y in (db._year4(w["year"]) for w in members) if y}
-        if years and max(years) - min(years) > 1:
+        if _same_name_far_apart(members):
             skipped.append((lead, key, sorted(spellings, key=str), "years disagree"))
             continue
         stats = {}
