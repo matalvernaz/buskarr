@@ -16,6 +16,7 @@ cannot fold anything that test would not call the same artist's work. Two conseq
 Files are moved, never deleted, and never onto an existing path. The ``albumartist`` tag is written
 as the lead so a media server groups them too — folder layout alone does not.
 """
+import collections
 import os
 
 from . import credit, db, repair, worker
@@ -47,9 +48,22 @@ def plan(root):
     lead — needing a second run to converge, and misdirecting a refile in between.
     """
     dirs = artist_dirs(root)
-    direct = {}
+    # One artist spelled two ways ("Said The Sky" beside "Said the Sky") folds into the spelling
+    # holding the most files. credited_to called each the other's lead, which resolved a directory
+    # to ITSELF, and the fold then "moved" its files onto their own names, suffixing them "(2)".
+    by_name = collections.defaultdict(list)
     for d in dirs:
-        parents = [p for p in dirs if p != d and credit.credited_to(d, p)]
+        by_name[credit._loose(d) or credit._fallback(d)].append(d)
+    direct = {}
+    for group in by_name.values():
+        if len(group) > 1:
+            keep = max(group, key=lambda d: (_file_count(os.path.join(root, d)), d))
+            direct.update({d: keep for d in group if d != keep})
+    for d in dirs:
+        if d in direct:
+            continue
+        parents = [p for p in dirs if p != d and p not in direct
+                   and credit._loose(p) != credit._loose(d) and credit.credited_to(d, p)]
         if parents:
             direct[d] = max(parents, key=len)
     out = []
@@ -58,8 +72,13 @@ def plan(root):
         while lead in direct and lead not in seen:
             seen.add(lead)
             lead = direct[lead]
-        out.append((d, lead))
+        if lead != d:
+            out.append((d, lead))
     return sorted(out, key=lambda pair: len(pair[0]), reverse=True)
+
+
+def _file_count(path):
+    return sum(len(files) for _, _, files in os.walk(path))
 
 
 def _prune(path, stop):

@@ -247,6 +247,54 @@ try:
     conn.close()
     shutil.rmtree(d, ignore_errors=True)
 
+    print("\n=== one artist spelled two ways is one directory ===")
+    conn, d = fresh()
+    held(conn, "Said The Sky", "Show & Tell", "Wide-Eyed", "2021")
+    held(conn, "Said The Sky", "Treading Water", "Wide-Eyed", "2021")
+    wid, _ = db.add_want(conn, "Said the Sky feat. Melissa Hayes", "Disciple", "Faith", None,
+                         231.0, "defender", match_album=True)
+    lead = conn.execute("SELECT artist_lead FROM wants WHERE id=?", (wid,)).fetchone()[0]
+    check("a duet credited with another capitalisation joins the existing directory",
+          lead == "Said The Sky", lead)
+    plain, _ = db.add_want(conn, "Said the Sky", "Rush Over Me (Solo)", "Faith", None, 240.0,
+                           "defender", match_album=True)
+    lead = conn.execute("SELECT artist_lead FROM wants WHERE id=?", (plain,)).fetchone()[0]
+    check("and so does the artist alone, spelled the other way", lead == "Said The Sky", lead)
+    again, created = db.add_want(conn, "Said The Sky", "Disciple", "Faith", None, 232.0,
+                                 "defender", match_album=True)
+    check("the same song credited without the guest is the same want, not a second download",
+          again == wid and not created, f"{again} vs {wid}, created={created}")
+    other, created = db.add_want(conn, "Said The Sky", "Disciple (Acoustic)", "Faith", None,
+                                 198.0, "defender", match_album=True)
+    check("while another performance of it is still its own want", created and other != wid)
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
+    shutil.rmtree(os.path.join(LIB, "Said The Sky"), ignore_errors=True)
+
+    print("\n=== fold never folds a directory into itself ===")
+    from buskarr import fold
+    root = LIB
+    for rel in ("Said The Sky/Wide-Eyed/03 - Show & Tell.flac",
+                "Said The Sky/Wide-Eyed/04 - Treading Water.flac",
+                "Said the Sky/Faith/Disciple.m4a"):
+        os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+        with open(os.path.join(root, rel), "wb") as fh:
+            fh.write(FLAC_SILENCE)
+    pairs = fold.plan(root)
+    check("the case twin folds into the spelling with more files, and nothing into itself",
+          pairs == [("Said the Sky", "Said The Sky")], str(pairs))
+    conn, d = fresh()
+    fold.fold(conn, root=root, dry_run=False, log=lambda *a: None)
+    left = sorted(os.path.relpath(os.path.join(p, f), root)
+                  for top in ("Said The Sky", "Said the Sky")
+                  for p, _, fs in os.walk(os.path.join(root, top)) for f in fs)
+    check("no file is renamed in place, and the twin is gone",
+          left == ["Said The Sky/Faith/Disciple.m4a", "Said The Sky/Wide-Eyed/03 - Show & Tell.flac",
+                   "Said The Sky/Wide-Eyed/04 - Treading Water.flac"], str(left))
+    conn.close()
+    shutil.rmtree(d, ignore_errors=True)
+    shutil.rmtree(os.path.join(LIB, "Said The Sky"), ignore_errors=True)
+
     print("\n=== fold tags a folded duet with its lead's display spelling ===")
     from buskarr import fold
     conn, d = fresh()
