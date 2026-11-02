@@ -24,5 +24,7 @@ jobs:
           cat yt-dlp-header.txt
           grep -q "JS runtimes: deno-" yt-dlp-header.txt
           grep -q "yt_dlp_ejs-" yt-dlp-header.txt
+      # tiddl creates ~/.tiddl as soon as it loads. The image's HOME is on the /state volume, which the
+      # entrypoint prepares and a bare docker run doesn't have, so give it a HOME that exists.
       - name: tiddl starts
-        run: docker run --rm --entrypoint /opt/tiddl-venv/bin/tiddl buskarr:ci --help
+        run: docker run --rm -e HOME=/tmp --entrypoint /opt/tiddl-venv/bin/tiddl buskarr:ci --help
