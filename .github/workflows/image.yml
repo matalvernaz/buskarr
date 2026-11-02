@@ -1,0 +1,28 @@
+name: image
+
+# Builds the Docker image and checks that the tools pinned in the Dockerfile still install and start.
+# The tests workflow runs outside the image, so this is the only check covering those pins (Python base,
+# Deno, yt-dlp, yt-dlp-ejs, tiddl), which Renovate updates. CI builds for amd64; the server builds the
+# same Dockerfile for arm64.
+on:
+  pull_request:
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the image
+        run: docker build -t buskarr:ci .
+      # yt-dlp's verbose header lists the JS runtime and EJS scripts it found. A Deno change that
+      # breaks the pairing shows up here as "JS runtimes: none". With no URL yt-dlp exits 2 after
+      # printing the header, so the exit code is ignored and the header is checked instead.
+      - name: yt-dlp finds Deno and its EJS scripts
+        run: |
+          docker run --rm --entrypoint yt-dlp buskarr:ci -v > yt-dlp-header.txt 2>&1 || true
+          cat yt-dlp-header.txt
+          grep -q "JS runtimes: deno-" yt-dlp-header.txt
+          grep -q "yt_dlp_ejs-" yt-dlp-header.txt
+      - name: tiddl starts
+        run: docker run --rm --entrypoint /opt/tiddl-venv/bin/tiddl buskarr:ci --help
