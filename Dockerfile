@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# renovate: datasource=github-releases depName=denoland/deno
 ARG DENO_VERSION=v2.9.8
 # Pinned: the installer fetches "latest" otherwise, so a rebuild could pull a Deno with
 # breaking changes and snap yt-dlp's JS runtime with no code change on our side.
