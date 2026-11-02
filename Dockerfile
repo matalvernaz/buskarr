@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.15-slim
 
 # ffmpeg supplies ffprobe for the library scanner; deno + yt-dlp-ejs are what YouTube's JS
 # challenges require. Baked in so a container rebuild can't silently regress the capability.
