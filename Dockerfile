@@ -6,14 +6,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/*
 
-ARG DENO_VERSION=v2.9.4
+ARG DENO_VERSION=v2.9.8
 # Pinned: the installer fetches "latest" otherwise, so a rebuild could pull a Deno with
 # breaking changes and snap yt-dlp's JS runtime with no code change on our side.
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s "$DENO_VERSION" \
     && /usr/local/bin/deno --version
 
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt "yt-dlp==2026.7.4" "yt-dlp-ejs==0.8.0"
+RUN pip install --no-cache-dir -r /tmp/requirements.txt "yt-dlp==2026.10.26" "yt-dlp-ejs==0.8.0"
 
 # tiddl in its own venv so its pins can't collide with the app's. Pinned: 3.4.4 is the
 # version whose TIDDL_AUTH override and `download url` CLI are verified working; 2.x has a
