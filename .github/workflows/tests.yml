@@ -12,8 +12,8 @@ jobs:
         # 3.13 is what the image runs; 3.12 keeps the tests honest about the floor.
         python: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       # The whole requirements file, not the one package the tests used to
